@@ -250,7 +250,15 @@ static async Task<Results<Ok<TradingSignal>, NotFound>> PatchSignalAsync(
         signal.IsClosed = request.IsClosed.Value;
     }
 
-    await dbContext.SaveChangesAsync(cancellationToken);
+    try
+    {
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        return TypedResults.NotFound();
+    }
+
     return TypedResults.Ok(signal);
 }
 
@@ -266,7 +274,14 @@ static async Task<Results<NoContent, NotFound>> DeleteSignalAsync(
     }
 
     dbContext.TradingSignals.Remove(signal);
-    await dbContext.SaveChangesAsync(cancellationToken);
+    try
+    {
+        await dbContext.SaveChangesAsync(cancellationToken);
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        return TypedResults.NotFound();
+    }
 
     return TypedResults.NoContent();
 }
