@@ -1,0 +1,11 @@
+{
+  "symbol": "NVDA",
+  "signal": "BUY",
+  "price": "185.30",
+  "timeframe": "15m",
+  "strategy": "EMA_RSI",
+  "rsi": "58",
+  "volume": "high",
+  "timestamp": "{{timenow}}",
+  "secret": "replace-with-your-webhook-secret"
+}
