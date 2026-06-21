@@ -72,7 +72,7 @@ app.UseExceptionHandler(exceptionHandlerApp =>
     exceptionHandlerApp.Run(async context =>
     {
         var logger = context.RequestServices.GetRequiredService<ILoggerFactory>().CreateLogger("GlobalException");
-        logger.LogError("Unhandled exception while processing {Method} {Path}", context.Request.Method, context.Request.Path);
+        logger.LogError("Unhandled exception while processing a request.");
         context.Response.StatusCode = StatusCodes.Status500InternalServerError;
         context.Response.ContentType = "application/json";
         await context.Response.WriteAsJsonAsync(new { error = "An unexpected server error occurred." });
