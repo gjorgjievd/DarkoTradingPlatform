@@ -9,6 +9,8 @@ using TradingAgent.DTOs;
 using TradingAgent.Models;
 using TradingAgent.Services;
 
+DotEnvLoader.Load();
+
 var builder = WebApplication.CreateBuilder(args);
 
 builder.Logging.ClearProviders();
@@ -28,8 +30,8 @@ builder.Services.AddSingleton(sp =>
     {
         TelegramBotToken = configuration["TELEGRAM_BOT_TOKEN"] ?? string.Empty,
         TelegramChatId = configuration["TELEGRAM_CHAT_ID"] ?? string.Empty,
-        ClaudeApiKey = configuration["CLAUDE_API_KEY"] ?? string.Empty,
-        ClaudeModel = configuration["CLAUDE_MODEL"] ?? "claude-3-5-sonnet-latest",
+        ClaudeApiKey = ResolveClaudeApiKey(configuration),
+        ClaudeModel = configuration["CLAUDE_MODEL"] ?? "claude-haiku-4-5-20251001",
         ClaudeEnabled = bool.TryParse(configuration["CLAUDE_ENABLED"], out var enabled) ? enabled : true,
         DatabasePath = configuration["DATABASE_PATH"] ?? "/app/data/tradingagent.db",
         RetentionDays = int.TryParse(configuration["RETENTION_DAYS"], out var retentionDays) ? Math.Max(retentionDays, 1) : 30,
@@ -102,6 +104,12 @@ api.MapPatch("/signals/{id:int}", PatchSignalAsync)
 api.MapDelete("/signals/{id:int}", DeleteSignalAsync)
     .WithName("DeleteSignal");
 
+api.MapGet("/test-claude", TestClaudeAsync)
+    .WithName("TestClaude");
+
+api.MapGet("/test-telegram", TestTelegramAsync)
+    .WithName("TestTelegram");
+
 app.MapFallbackToFile("index.html");
 
 app.Run();
@@ -120,6 +128,17 @@ static void ValidateRequiredConfiguration(IServiceProvider services)
     {
         throw new InvalidOperationException("WEBHOOK_SECRET must be configured before starting TradingAgent.");
     }
+}
+
+static string ResolveClaudeApiKey(IConfiguration configuration)
+{
+    var claudeApiKey = configuration["CLAUDE_API_KEY"];
+    if (!string.IsNullOrWhiteSpace(claudeApiKey))
+    {
+        return claudeApiKey;
+    }
+
+    return configuration["ANTHROPIC_API_KEY"] ?? string.Empty;
 }
 
 static async Task<IResult> HandleTradingViewWebhookAsync(
@@ -166,32 +185,44 @@ static async Task<IResult> HandleTradingViewWebhookAsync(
         return TypedResults.Unauthorized();
     }
 
-    var analysisResponse = await claudeAnalysisService.AnalyzeAsync(payload, cancellationToken);
+    logger.LogInformation(
+        "Webhook received. Symbol={Symbol}, Signal={Signal}, Timeframe={Timeframe}, Price={Price}",
+        payload.Symbol.Trim().ToUpperInvariant(),
+        payload.Signal.Trim().ToUpperInvariant(),
+        payload.Timeframe ?? "N/A",
+        payload.Price ?? "N/A");
 
     var tradingSignal = new TradingSignal
     {
         Symbol = payload.Symbol.Trim().ToUpperInvariant(),
         OriginalSignal = payload.Signal.Trim().ToUpperInvariant(),
-        ClaudeAction = analysisResponse.Analysis?.Action,
-        Confidence = analysisResponse.Analysis?.Confidence,
-        RiskLevel = analysisResponse.Analysis?.RiskLevel,
         Price = ParseDecimal(payload.Price),
         Timeframe = payload.Timeframe?.Trim(),
         Strategy = payload.Strategy?.Trim(),
         RawPayload = rawPayload,
-        ClaudeRawResponse = analysisResponse.RawResponse,
-        ShortReason = analysisResponse.Analysis?.ShortReason ?? analysisResponse.Error,
-        SuggestedStopLoss = analysisResponse.Analysis?.SuggestedStopLoss,
-        SuggestedTakeProfit = analysisResponse.Analysis?.SuggestedTakeProfit,
         CreatedAtUtc = DateTime.UtcNow
     };
 
     dbContext.TradingSignals.Add(tradingSignal);
     await dbContext.SaveChangesAsync(cancellationToken);
 
+    var analysisResponse = await claudeAnalysisService.AnalyzeAsync(payload, cancellationToken);
+
+    tradingSignal.ClaudeAction = analysisResponse.Analysis?.Action;
+    tradingSignal.Confidence = analysisResponse.Analysis?.Confidence;
+    tradingSignal.RiskLevel = analysisResponse.Analysis?.RiskLevel;
+    tradingSignal.ClaudeRawResponse = analysisResponse.RawResponse;
+    tradingSignal.ShortReason = analysisResponse.IsFallback
+        ? analysisResponse.Error ?? "Claude unavailable, fallback mode."
+        : analysisResponse.Analysis?.ShortReason;
+    tradingSignal.SuggestedStopLoss = analysisResponse.Analysis?.SuggestedStopLoss;
+    tradingSignal.SuggestedTakeProfit = analysisResponse.Analysis?.SuggestedTakeProfit;
+
+    await dbContext.SaveChangesAsync(cancellationToken);
+
     await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, cancellationToken);
 
-    return TypedResults.Created($"/api/signals/{tradingSignal.Id}", tradingSignal);
+    return TypedResults.Ok(tradingSignal);
 }
 
 static async Task<Ok<List<TradingSignal>>> GetSignalsAsync(
@@ -296,4 +327,36 @@ static decimal? ParseDecimal(string? value)
     return decimal.TryParse(value, NumberStyles.Any, CultureInfo.InvariantCulture, out var parsedValue)
         ? parsedValue
         : null;
+}
+
+static async Task<IResult> TestClaudeAsync(
+    IClaudeAnalysisService claudeAnalysisService,
+    CancellationToken cancellationToken)
+{
+    var result = await claudeAnalysisService.TestAsync(cancellationToken);
+
+    return TypedResults.Ok(new
+    {
+        success = result.Success,
+        httpStatus = result.HttpStatusCode,
+        model = result.Model,
+        rawResponse = result.RawResponse,
+        parsedResponse = result.ParsedResponse,
+        elapsedMs = result.ElapsedMilliseconds,
+        error = result.Error
+    });
+}
+
+static async Task<IResult> TestTelegramAsync(
+    ITelegramNotificationService telegramNotificationService,
+    CancellationToken cancellationToken)
+{
+    var result = await telegramNotificationService.SendTestAsync(cancellationToken);
+
+    return TypedResults.Ok(new
+    {
+        success = result.Success,
+        httpStatus = result.HttpStatusCode,
+        error = result.Error
+    });
 }

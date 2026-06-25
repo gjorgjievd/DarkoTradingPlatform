@@ -21,9 +21,29 @@ public sealed class TelegramNotificationService(
             return;
         }
 
+        var message = BuildMessage(signal, usedFallback);
+        await SendMessageAsync(message, cancellationToken);
+    }
+
+    public async Task<TelegramTestResult> SendTestAsync(CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
+        {
+            return new TelegramTestResult
+            {
+                Success = false,
+                Error = "Telegram bot token or chat ID is not configured."
+            };
+        }
+
+        const string message = "✅ TradingAgent Telegram test message — connection OK.";
+        return await SendMessageAsync(message, cancellationToken);
+    }
+
+    private async Task<TelegramTestResult> SendMessageAsync(string message, CancellationToken cancellationToken)
+    {
         var client = httpClientFactory.CreateClient(HttpClientName);
         var requestUri = $"https://api.telegram.org/bot{settings.TelegramBotToken}/sendMessage";
-        var message = BuildMessage(signal, usedFallback);
 
         var payload = new
         {
@@ -38,40 +58,75 @@ public sealed class TelegramNotificationService(
                 new StringContent(JsonSerializer.Serialize(payload), Encoding.UTF8, "application/json"),
                 cancellationToken);
 
-            if (!response.IsSuccessStatusCode)
+            var responseBody = await response.Content.ReadAsStringAsync(cancellationToken);
+
+            if (response.IsSuccessStatusCode)
             {
-                logger.LogWarning("Telegram notification failed with status code {StatusCode}.", (int)response.StatusCode);
+                logger.LogInformation("Telegram message sent successfully. StatusCode={StatusCode}", (int)response.StatusCode);
+                return new TelegramTestResult
+                {
+                    Success = true,
+                    HttpStatusCode = (int)response.StatusCode
+                };
             }
+
+            logger.LogWarning(
+                "Telegram notification failed. StatusCode={StatusCode}, Response={Response}",
+                (int)response.StatusCode,
+                responseBody.Length > 500 ? responseBody[..500] : responseBody);
+
+            return new TelegramTestResult
+            {
+                Success = false,
+                HttpStatusCode = (int)response.StatusCode,
+                Error = $"Telegram request failed with status {(int)response.StatusCode}."
+            };
         }
         catch (Exception exception)
         {
             logger.LogError(exception, "Telegram notification failed unexpectedly.");
+            return new TelegramTestResult
+            {
+                Success = false,
+                Error = "Telegram notification failed unexpectedly."
+            };
         }
     }
 
     private static string BuildMessage(TradingSignal signal, bool usedFallback)
     {
         var builder = new StringBuilder();
-        builder.AppendLine("📊 Trading Signal");
+        builder.AppendLine("📈 Trading Signal");
         builder.AppendLine();
         builder.AppendLine($"Symbol: {signal.Symbol}");
-        builder.AppendLine($"Original Signal: {signal.OriginalSignal}");
-        builder.AppendLine($"Claude Action: {signal.ClaudeAction ?? "N/A"}");
-        builder.AppendLine($"Confidence: {(signal.Confidence.HasValue ? $"{signal.Confidence.Value}%" : "N/A")}");
-        builder.AppendLine($"Risk: {signal.RiskLevel ?? "N/A"}");
-        builder.AppendLine($"Price: {FormatDecimal(signal.Price)}");
         builder.AppendLine($"Timeframe: {signal.Timeframe ?? "N/A"}");
         builder.AppendLine();
-        builder.AppendLine("Reason:");
-        builder.AppendLine(signal.ShortReason ?? "Claude analysis unavailable.");
+        builder.AppendLine($"Original Signal: {signal.OriginalSignal}");
         builder.AppendLine();
-        builder.AppendLine($"Stop Loss: {FormatDecimal(signal.SuggestedStopLoss)}");
-        builder.AppendLine($"Take Profit: {FormatDecimal(signal.SuggestedTakeProfit)}");
+        builder.AppendLine($"Claude Decision: {signal.ClaudeAction ?? "N/A"}");
+        builder.AppendLine();
+        builder.AppendLine($"Confidence: {(signal.Confidence.HasValue ? $"{signal.Confidence.Value}%" : "N/A")}");
+        builder.AppendLine();
+        builder.AppendLine($"Risk: {signal.RiskLevel ?? "N/A"}");
+        builder.AppendLine();
+        builder.AppendLine("Entry:");
+        builder.AppendLine(FormatDecimal(signal.Price));
+        builder.AppendLine();
+        builder.AppendLine("Stop Loss:");
+        builder.AppendLine(FormatDecimal(signal.SuggestedStopLoss));
+        builder.AppendLine();
+        builder.AppendLine("Take Profit:");
+        builder.AppendLine(FormatDecimal(signal.SuggestedTakeProfit));
+        builder.AppendLine();
+        builder.AppendLine("Reason:");
 
         if (usedFallback)
         {
-            builder.AppendLine();
-            builder.AppendLine("Status: Fallback mode used.");
+            builder.AppendLine("Claude unavailable, fallback mode.");
+        }
+        else
+        {
+            builder.AppendLine(signal.ShortReason ?? "No reason provided.");
         }
 
         return builder.ToString();

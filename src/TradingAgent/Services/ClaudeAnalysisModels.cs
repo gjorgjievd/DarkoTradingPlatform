@@ -17,3 +17,21 @@ public sealed class ClaudeAnalysisResult
     public decimal? SuggestedStopLoss { get; set; }
     public decimal? SuggestedTakeProfit { get; set; }
 }
+
+public sealed class ClaudeTestResult
+{
+    public bool Success { get; init; }
+    public int HttpStatusCode { get; init; }
+    public string Model { get; init; } = string.Empty;
+    public string? RawResponse { get; init; }
+    public ClaudeAnalysisResult? ParsedResponse { get; init; }
+    public double ElapsedMilliseconds { get; init; }
+    public string? Error { get; init; }
+}
+
+public sealed class TelegramTestResult
+{
+    public bool Success { get; init; }
+    public int? HttpStatusCode { get; init; }
+    public string? Error { get; init; }
+}
