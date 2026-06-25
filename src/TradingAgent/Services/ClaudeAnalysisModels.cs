@@ -16,6 +16,9 @@ public sealed class ClaudeAnalysisResult
     public string? RiskLevel { get; set; }
     public decimal? SuggestedStopLoss { get; set; }
     public decimal? SuggestedTakeProfit { get; set; }
+    public decimal? RiskRewardRatio { get; set; }
+    public decimal? PositionSizePercent { get; set; }
+    public bool? ShouldNotify { get; set; }
 }
 
 public sealed class ClaudeTestResult

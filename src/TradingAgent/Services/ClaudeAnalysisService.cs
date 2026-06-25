@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 using TradingAgent.Configuration;
+using TradingAgent.DTOs;
 using TradingAgent.Models;
 
 namespace TradingAgent.Services;
@@ -17,12 +18,37 @@ public sealed class ClaudeAnalysisService(
     private const string MessagesEndpoint = "v1/messages";
     private const int MaxLoggedResponseLength = 2000;
 
+    private const string FilterSystemPrompt =
+        "You are a strict professional trading signal filter. Evaluate TradingView alerts against live market data and decide whether the trader should act. " +
+        "Be conservative: prefer WAIT or IGNORE when setup quality is weak, indicators conflict, volume is poor, or risk/reward is unfavorable. " +
+        "Only recommend BUY or SELL when multiple factors align with high conviction. " +
+        "Set shouldNotify=true only for actionable setups with confidence >= 70. " +
+        "Respond ONLY with valid JSON matching the required schema.";
+
+    private const string FilterJsonSchema =
+        """
+        {
+          "decision": "BUY | SELL | WAIT | IGNORE | EXIT",
+          "confidence": 0-100,
+          "risk": "LOW | MEDIUM | HIGH",
+          "reason": "...",
+          "stopLoss": number | null,
+          "takeProfit": number | null,
+          "riskRewardRatio": number | null,
+          "positionSizePercent": number | null,
+          "shouldNotify": true | false
+        }
+        """;
+
     private static readonly JsonSerializerOptions SerializerOptions = new(JsonSerializerDefaults.Web)
     {
         PropertyNameCaseInsensitive = true
     };
 
-    public async Task<ClaudeAnalysisResponse> AnalyzeAsync(TradingViewWebhookRequest signal, CancellationToken cancellationToken)
+    public async Task<ClaudeAnalysisResponse> AnalyzeAsync(
+        TradingViewWebhookRequest signal,
+        MarketContext? marketContext,
+        CancellationToken cancellationToken)
     {
         if (!settings.ClaudeEnabled)
         {
@@ -37,11 +63,10 @@ public sealed class ClaudeAnalysisService(
         }
 
         var prompt =
-            $"Analyze this {signal.Signal?.Trim().ToUpperInvariant()} signal for {signal.Symbol?.Trim().ToUpperInvariant()} " +
-            $"and return a single JSON object with keys: action, confidence, reason, risk, suggestedStopLoss, suggestedTakeProfit. " +
-            $"action must be BUY, SELL, WAIT, or IGNORE. confidence must be 0-100. risk must be LOW, MEDIUM, or HIGH. " +
-            $"Signal data: {JsonSerializer.Serialize(signal, SerializerOptions)}";
-        var result = await SendRequestAsync(prompt, cancellationToken);
+            $"You are filtering a TradingView alert. Return ONLY valid JSON with this schema:\n{FilterJsonSchema}\n" +
+            $"TradingView signal: {JsonSerializer.Serialize(signal, SerializerOptions)}\n" +
+            $"Live market context: {JsonSerializer.Serialize(marketContext, SerializerOptions)}";
+        var result = await SendRequestAsync(prompt, cancellationToken, FilterSystemPrompt);
 
         if (!result.IsSuccess)
         {
@@ -83,8 +108,9 @@ public sealed class ClaudeAnalysisService(
         }
 
         var result = await SendRequestAsync(
-            "Analyze this BUY signal for NVDA at price 199.20 on the 1H timeframe. Return JSON with action, confidence, reason, risk, suggestedStopLoss, suggestedTakeProfit.",
-            cancellationToken);
+            $"You are filtering a TradingView BUY alert for NVDA at 199.20 on the 1H timeframe. Return ONLY valid JSON with this schema:\n{FilterJsonSchema}",
+            cancellationToken,
+            FilterSystemPrompt);
 
         return new ClaudeTestResult
         {
@@ -98,7 +124,10 @@ public sealed class ClaudeAnalysisService(
         };
     }
 
-    private async Task<ClaudeRequestResult> SendRequestAsync(string userPrompt, CancellationToken cancellationToken)
+    private async Task<ClaudeRequestResult> SendRequestAsync(
+        string userPrompt,
+        CancellationToken cancellationToken,
+        string? systemPrompt = null)
     {
         var stopwatch = Stopwatch.StartNew();
 
@@ -114,7 +143,7 @@ public sealed class ClaudeAnalysisService(
             {
                 model = settings.ClaudeModel,
                 max_tokens = 1024,
-                system = "You are a professional trading assistant. Respond ONLY with valid JSON.",
+                system = systemPrompt ?? "You are a professional trading assistant. Respond ONLY with valid JSON.",
                 messages = new[]
                 {
                     new { role = "user", content = userPrompt }
@@ -232,7 +261,7 @@ public sealed class ClaudeAnalysisService(
             using var document = JsonDocument.Parse(jsonPayload);
             var root = document.RootElement;
 
-            if (!root.TryGetProperty("action", out _))
+            if (!root.TryGetProperty("decision", out _) && !root.TryGetProperty("action", out _))
             {
                 if (root.TryGetProperty("analysis", out var analysisElement) && analysisElement.ValueKind == JsonValueKind.Object)
                 {
@@ -242,12 +271,15 @@ public sealed class ClaudeAnalysisService(
 
             return new ClaudeAnalysisResult
             {
-                Action = GetString(root, "action") ?? GetString(root, "recommendation"),
+                Action = GetString(root, "decision") ?? GetString(root, "action") ?? GetString(root, "recommendation"),
                 Confidence = GetInt(root, "confidence"),
                 ShortReason = GetString(root, "reason") ?? GetString(root, "shortReason"),
                 RiskLevel = GetString(root, "risk") ?? GetString(root, "riskLevel"),
-                SuggestedStopLoss = GetDecimal(root, "suggestedStopLoss"),
-                SuggestedTakeProfit = GetDecimal(root, "suggestedTakeProfit")
+                SuggestedStopLoss = GetDecimal(root, "stopLoss") ?? GetDecimal(root, "suggestedStopLoss"),
+                SuggestedTakeProfit = GetDecimal(root, "takeProfit") ?? GetDecimal(root, "suggestedTakeProfit"),
+                RiskRewardRatio = GetDecimal(root, "riskRewardRatio"),
+                PositionSizePercent = GetDecimal(root, "positionSizePercent"),
+                ShouldNotify = GetBool(root, "shouldNotify")
             };
         }
         catch (JsonException)
@@ -333,6 +365,22 @@ public sealed class ClaudeAnalysisService(
         return null;
     }
 
+    private static bool? GetBool(JsonElement root, string propertyName)
+    {
+        if (!root.TryGetProperty(propertyName, out var element))
+        {
+            return null;
+        }
+
+        return element.ValueKind switch
+        {
+            JsonValueKind.True => true,
+            JsonValueKind.False => false,
+            JsonValueKind.String when bool.TryParse(element.GetString(), out var parsed) => parsed,
+            _ => null
+        };
+    }
+
     private static string? ExtractJsonObject(string value)
     {
         var startIndex = value.IndexOf('{');
@@ -345,12 +393,22 @@ public sealed class ClaudeAnalysisService(
 
     private static void Normalize(ClaudeAnalysisResult result)
     {
-        result.Action = NormalizeToken(result.Action, "WAIT", ["BUY", "SELL", "WAIT", "IGNORE"]);
+        result.Action = NormalizeToken(result.Action, "WAIT", ["BUY", "SELL", "WAIT", "IGNORE", "EXIT"]);
         result.RiskLevel = NormalizeToken(result.RiskLevel, "MEDIUM", ["LOW", "MEDIUM", "HIGH"]);
         result.Confidence = result.Confidence.HasValue ? Math.Clamp(result.Confidence.Value, 0, 100) : null;
         result.SuggestedStopLoss = NormalizeDecimal(result.SuggestedStopLoss);
         result.SuggestedTakeProfit = NormalizeDecimal(result.SuggestedTakeProfit);
+        result.RiskRewardRatio = NormalizeDecimal(result.RiskRewardRatio);
+        result.PositionSizePercent = result.PositionSizePercent.HasValue
+            ? Math.Clamp(result.PositionSizePercent.Value, 0, 100)
+            : null;
         result.ShortReason = string.IsNullOrWhiteSpace(result.ShortReason) ? "No reason provided." : result.ShortReason.Trim();
+
+        if (!result.ShouldNotify.HasValue)
+        {
+            result.ShouldNotify = result.Action is "BUY" or "SELL"
+                && result.Confidence >= 70;
+        }
     }
 
     private static string NormalizeToken(string? value, string fallback, string[] allowedValues)

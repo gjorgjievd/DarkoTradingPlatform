@@ -58,7 +58,8 @@
 
         input,
         textarea,
-        button {
+        button,
+        select {
             width: 100%;
             border-radius: 8px;
             border: 1px solid #4b5563;
@@ -109,6 +110,11 @@
             font-size: 0.85rem;
         }
 
+        .pill.test {
+            background: #7c2d12;
+            color: #ffedd5;
+        }
+
         .status {
             margin-bottom: 16px;
             color: #93c5fd;
@@ -126,11 +132,88 @@
                 <input id="symbolFilter" placeholder="e.g. NVDA" />
             </div>
             <div>
+                <label for="signalFilter">Signal type</label>
+                <select id="signalFilter">
+                    <option value="all">All</option>
+                    <option value="real">Real</option>
+                    <option value="test">Test</option>
+                </select>
+            </div>
+            <div>
                 <button id="refreshButton">Refresh</button>
             </div>
         </div>
 
+        <div class="cards" id="performanceCards"></div>
+
         <div class="cards" id="summaryCards"></div>
+
+        <div class="panel">
+            <h2>Open Positions</h2>
+            <div style="overflow-x:auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Symbol</th>
+                            <th>Entry</th>
+                            <th>Quantity</th>
+                            <th>Risk</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="openPositionsBody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Closed Positions</h2>
+            <div style="overflow-x:auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Symbol</th>
+                            <th>Entry / Exit</th>
+                            <th>P/L</th>
+                            <th>Duration</th>
+                        </tr>
+                    </thead>
+                    <tbody id="closedPositionsBody"></tbody>
+                </table>
+            </div>
+        </div>
+
+        <div class="panel">
+            <h2>Webhook History</h2>
+            <div class="toolbar" style="margin-bottom: 12px;">
+                <div>
+                    <label for="webhookFilter">Webhook filter</label>
+                    <select id="webhookFilter">
+                        <option value="all">All</option>
+                        <option value="real">Real</option>
+                        <option value="test">Test</option>
+                    </select>
+                </div>
+            </div>
+            <div style="overflow-x:auto;">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Time</th>
+                            <th>Source</th>
+                            <th>Type</th>
+                            <th>Symbol</th>
+                            <th>Signal</th>
+                            <th>Result</th>
+                        </tr>
+                    </thead>
+                    <tbody id="webhookHistoryBody"></tbody>
+                </table>
+            </div>
+        </div>
 
         <div class="panel">
             <h2>Latest signals</h2>
@@ -140,6 +223,8 @@
                         <tr>
                             <th>ID</th>
                             <th>Signal</th>
+                            <th>Claude Filter</th>
+                            <th>Market</th>
                             <th>Reason</th>
                             <th>Trade details</th>
                             <th>Edit</th>
@@ -153,36 +238,196 @@
 
     <script>
         const statusElement = document.getElementById('status');
+        const performanceCards = document.getElementById('performanceCards');
         const summaryCards = document.getElementById('summaryCards');
+        const openPositionsBody = document.getElementById('openPositionsBody');
+        const closedPositionsBody = document.getElementById('closedPositionsBody');
         const signalsBody = document.getElementById('signalsBody');
         const symbolFilter = document.getElementById('symbolFilter');
+        const signalFilter = document.getElementById('signalFilter');
+        const webhookFilter = document.getElementById('webhookFilter');
+        const webhookHistoryBody = document.getElementById('webhookHistoryBody');
         const refreshButton = document.getElementById('refreshButton');
 
-        refreshButton.addEventListener('click', loadSignals);
+        refreshButton.addEventListener('click', loadDashboard);
         symbolFilter.addEventListener('keydown', (event) => {
             if (event.key === 'Enter') {
-                loadSignals();
+                loadDashboard();
             }
         });
+        signalFilter.addEventListener('change', loadDashboard);
+        webhookFilter.addEventListener('change', loadWebhookHistory);
 
-        async function loadSignals() {
-            statusElement.textContent = 'Loading signals...';
+        async function loadDashboard() {
+            statusElement.textContent = 'Loading dashboard...';
             const symbol = symbolFilter.value.trim();
-            const url = symbol ? `/api/signals?symbol=${encodeURIComponent(symbol)}` : '/api/signals';
+            const signalsUrl = symbol ? `/api/signals?symbol=${encodeURIComponent(symbol)}` : '/api/signals';
 
             try {
-                const response = await fetch(url);
-                if (!response.ok) {
-                    throw new Error(`Request failed with status ${response.status}`);
+                const [signalsResponse, openResponse, closedResponse] = await Promise.all([
+                    fetch(signalsUrl),
+                    fetch('/api/positions/open'),
+                    fetch('/api/positions/closed')
+                ]);
+
+                if (!signalsResponse.ok || !openResponse.ok || !closedResponse.ok) {
+                    throw new Error('One or more dashboard requests failed.');
                 }
 
-                const signals = await response.json();
+                let signals = await signalsResponse.json();
+                const openPositions = await openResponse.json();
+                const closedPositions = await closedResponse.json();
+
+                const typeFilter = signalFilter.value;
+                if (typeFilter === 'real') {
+                    signals = signals.filter(signal => !signal.isTest);
+                } else if (typeFilter === 'test') {
+                    signals = signals.filter(signal => signal.isTest);
+                }
+
+                renderPerformance(closedPositions);
                 renderSummary(signals);
+                renderOpenPositions(openPositions);
+                renderClosedPositions(closedPositions);
                 renderSignals(signals);
-                statusElement.textContent = `Loaded ${signals.length} signal(s).`;
+                await loadWebhookHistory();
+                statusElement.textContent = `Loaded ${signals.length} signal(s), ${openPositions.length} open and ${closedPositions.length} closed position(s).`;
             } catch (error) {
                 statusElement.textContent = error.message;
             }
+        }
+
+        async function loadWebhookHistory() {
+            const filter = webhookFilter.value;
+            const url = filter === 'all' ? '/api/webhooks/history' : `/api/webhooks/history?filter=${encodeURIComponent(filter)}`;
+            const response = await fetch(url);
+            if (!response.ok) {
+                webhookHistoryBody.innerHTML = '<tr><td colspan="7">Failed to load webhook history.</td></tr>';
+                return;
+            }
+
+            const history = await response.json();
+            renderWebhookHistory(history);
+        }
+
+        function renderWebhookHistory(history) {
+            if (history.length === 0) {
+                webhookHistoryBody.innerHTML = '<tr><td colspan="7">No webhook requests found.</td></tr>';
+                return;
+            }
+
+            webhookHistoryBody.innerHTML = history.map((entry) => `
+                <tr>
+                    <td>${entry.id}</td>
+                    <td>${formatDate(entry.receivedAtUtc)}</td>
+                    <td>${entry.source}</td>
+                    <td>${entry.isTest ? '<span class="pill test">TEST</span>' : 'REAL'}</td>
+                    <td>${entry.symbol || 'N/A'}</td>
+                    <td>${entry.signalType || 'N/A'}</td>
+                    <td>
+                        ${entry.resultStatus}
+                        ${entry.errorMessage ? `<br /><span class="pill">${escapeHtml(entry.errorMessage)}</span>` : ''}
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function renderPerformance(closedPositions) {
+            const wins = closedPositions.filter(position => typeof position.profitLoss === 'number' && position.profitLoss > 0);
+            const losses = closedPositions.filter(position => typeof position.profitLoss === 'number' && position.profitLoss < 0);
+            const totalProfitLoss = closedPositions.reduce((sum, position) => sum + (position.profitLoss ?? 0), 0);
+            const winRate = closedPositions.length === 0 ? 0 : (wins.length / closedPositions.length) * 100;
+            const averageWin = wins.length === 0 ? 0 : wins.reduce((sum, position) => sum + position.profitLoss, 0) / wins.length;
+            const averageLoss = losses.length === 0 ? 0 : losses.reduce((sum, position) => sum + position.profitLoss, 0) / losses.length;
+
+            const cards = [
+                ['Total P/L', totalProfitLoss.toFixed(2)],
+                ['Win Rate', `${winRate.toFixed(1)}%`],
+                ['Average Win', averageWin.toFixed(2)],
+                ['Average Loss', averageLoss.toFixed(2)]
+            ];
+
+            performanceCards.innerHTML = cards.map(([label, value]) => `
+                <div class="card">
+                    <div>${label}</div>
+                    <strong style="font-size: 1.6rem;">${value}</strong>
+                </div>
+            `).join('');
+        }
+
+        function renderOpenPositions(positions) {
+            if (positions.length === 0) {
+                openPositionsBody.innerHTML = '<tr><td colspan="6">No open positions.</td></tr>';
+                return;
+            }
+
+            openPositionsBody.innerHTML = positions.map((position) => `
+                <tr>
+                    <td>${position.id}</td>
+                    <td><strong>${position.symbol}</strong></td>
+                    <td>
+                        ${formatValue(position.entryPrice)}<br />
+                        <span class="pill">${formatDate(position.entryTimeUtc)}</span>
+                    </td>
+                    <td>${formatValue(position.quantity)}</td>
+                    <td>${formatValue(position.maxRiskPercent)}%</td>
+                    <td>
+                        <div class="actions">
+                            <button class="danger" onclick="closePosition(${position.id})">Close</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        function renderClosedPositions(positions) {
+            if (positions.length === 0) {
+                closedPositionsBody.innerHTML = '<tr><td colspan="5">No closed positions.</td></tr>';
+                return;
+            }
+
+            closedPositionsBody.innerHTML = positions.map((position) => `
+                <tr>
+                    <td>${position.id}</td>
+                    <td><strong>${position.symbol}</strong></td>
+                    <td>
+                        Entry: ${formatValue(position.entryPrice)}<br />
+                        Exit: ${formatValue(position.exitPrice)}
+                    </td>
+                    <td>
+                        ${formatValue(position.profitLoss)}<br />
+                        ${position.profitLossPercent != null ? `${formatValue(position.profitLossPercent)}%` : 'N/A'}
+                    </td>
+                    <td>
+                        ${formatDate(position.entryTimeUtc)}<br />
+                        to ${formatDate(position.exitTimeUtc)}
+                    </td>
+                </tr>
+            `).join('');
+        }
+
+        async function closePosition(id) {
+            if (!confirm(`Close position ${id}?`)) {
+                return;
+            }
+
+            const response = await fetch(`/api/positions/${id}/close`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+
+            if (!response.ok) {
+                statusElement.textContent = `Failed to close position ${id}.`;
+                return;
+            }
+
+            statusElement.textContent = `Position ${id} closed.`;
+            await loadDashboard();
+        }
+
+        async function loadSignals() {
+            await loadDashboard();
         }
 
         function renderSummary(signals) {
@@ -203,6 +448,7 @@
                 if (action === 'SELL') summary.sell++;
                 if (action === 'WAIT') summary.wait++;
                 if (action === 'IGNORE') summary.ignore++;
+                if (action === 'EXIT') summary.ignore++;
 
                 if (typeof signal.profitLoss === 'number') {
                     summary.totalProfitLoss += signal.profitLoss;
@@ -232,7 +478,7 @@
 
         function renderSignals(signals) {
             if (signals.length === 0) {
-                signalsBody.innerHTML = '<tr><td colspan="5">No signals found.</td></tr>';
+                signalsBody.innerHTML = '<tr><td colspan="7">No signals found.</td></tr>';
                 return;
             }
 
@@ -240,19 +486,33 @@
                 <tr>
                     <td>${signal.id}<br /><span class="pill">${formatDate(signal.createdAtUtc)}</span></td>
                     <td>
-                        <strong>${signal.symbol}</strong><br />
-                        Original: ${signal.originalSignal}<br />
-                        Claude: ${signal.claudeAction || 'N/A'}<br />
+                        <strong>${signal.symbol}</strong>
+                        ${signal.isTest ? ' <span class="pill test">TEST</span>' : ''}<br />
+                        TradingView: ${signal.originalSignal}<br />
+                        Source: ${signal.source || 'N/A'}<br />
+                        Timeframe: ${signal.timeframe || 'N/A'}<br />
+                        Strategy: ${signal.strategy || 'N/A'}
+                    </td>
+                    <td>
+                        Decision: ${signal.claudeAction || 'N/A'}<br />
                         Confidence: ${signal.confidence ?? 'N/A'}<br />
-                        Risk: ${signal.riskLevel || 'N/A'}
+                        Risk: ${signal.riskLevel || 'N/A'}<br />
+                        Notified: ${signal.notified ? 'Yes' : 'No'}
+                    </td>
+                    <td>
+                        RSI: ${formatValue(signal.marketData?.rsi14)}<br />
+                        EMA9: ${formatValue(signal.marketData?.ema9)}<br />
+                        EMA20: ${formatValue(signal.marketData?.ema20)}<br />
+                        EMA50: ${formatValue(signal.marketData?.ema50)}<br />
+                        Vol Spike: ${formatVolumeSpike(signal.marketData?.currentVolume, signal.marketData?.averageVolume20)}
                     </td>
                     <td>${escapeHtml(signal.shortReason || 'No analysis captured.')}</td>
                     <td>
                         Price: ${formatValue(signal.price)}<br />
-                        Timeframe: ${signal.timeframe || 'N/A'}<br />
-                        Strategy: ${signal.strategy || 'N/A'}<br />
                         Stop Loss: ${formatValue(signal.suggestedStopLoss)}<br />
-                        Take Profit: ${formatValue(signal.suggestedTakeProfit)}
+                        Take Profit: ${formatValue(signal.suggestedTakeProfit)}<br />
+                        Risk/Reward: ${formatValue(signal.riskRewardRatio)}<br />
+                        Position Size: ${formatValue(signal.positionSizePercent)}%
                     </td>
                     <td>
                         <div class="actions">
@@ -293,7 +553,7 @@
             }
 
             statusElement.textContent = `Signal ${id} updated.`;
-            await loadSignals();
+            await loadDashboard();
         }
 
         async function deleteSignal(id) {
@@ -308,7 +568,7 @@
             }
 
             statusElement.textContent = `Signal ${id} deleted.`;
-            await loadSignals();
+            await loadDashboard();
         }
 
         function formatDate(value) {
@@ -319,6 +579,15 @@
             return typeof value === 'number' ? value.toFixed(2) : 'N/A';
         }
 
+        function formatVolumeSpike(currentVolume, averageVolume) {
+            if (typeof currentVolume !== 'number' || typeof averageVolume !== 'number' || averageVolume === 0) {
+                return 'N/A';
+            }
+
+            const spikePercent = ((currentVolume / averageVolume) - 1) * 100;
+            return `${spikePercent.toFixed(1)}%`;
+        }
+
         function escapeHtml(value) {
             return String(value)
                 .replaceAll('&', '&amp;')
@@ -326,7 +595,7 @@
                 .replaceAll('>', '&gt;');
         }
 
-        loadSignals();
+        loadDashboard();
     </script>
 </body>
 </html>

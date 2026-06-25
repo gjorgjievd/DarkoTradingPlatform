@@ -32,6 +32,9 @@ public sealed class TradingViewWebhookRequest
     [JsonPropertyName("timestamp")]
     public string? Timestamp { get; init; }
 
+    [JsonPropertyName("source")]
+    public string? Source { get; init; }
+
     [JsonExtensionData]
     public Dictionary<string, JsonElement>? AdditionalData { get; init; }
 }

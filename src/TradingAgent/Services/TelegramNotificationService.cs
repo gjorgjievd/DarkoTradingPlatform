@@ -13,7 +13,7 @@ public sealed class TelegramNotificationService(
 {
     public const string HttpClientName = "telegram";
 
-    public async Task SendSignalAsync(TradingSignal signal, bool usedFallback, CancellationToken cancellationToken)
+    public async Task SendSignalAsync(TradingSignal signal, bool usedFallback, bool isTest, CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
         {
@@ -22,7 +22,59 @@ public sealed class TelegramNotificationService(
         }
 
         var message = BuildMessage(signal, usedFallback);
+        if (isTest)
+        {
+            message = $"🧪 TEST\n{message}";
+        }
+
         await SendMessageAsync(message, cancellationToken);
+    }
+
+    public async Task SendPositionOpenedAsync(Position position, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
+        {
+            logger.LogWarning("Telegram position-open notification skipped because bot configuration is missing.");
+            return;
+        }
+
+        var message = new StringBuilder();
+        message.AppendLine("📥 Paper Position Opened");
+        message.AppendLine();
+        message.AppendLine($"Symbol: {position.Symbol}");
+        message.AppendLine($"Entry Price: {FormatDecimal(position.EntryPrice)}");
+        message.AppendLine($"Quantity: {FormatDecimal(position.Quantity)}");
+        message.AppendLine($"Entry Time: {position.EntryTimeUtc:u}");
+        if (position.MaxRiskPercent.HasValue)
+        {
+            message.AppendLine($"Max Risk: {FormatDecimal(position.MaxRiskPercent)}%");
+        }
+
+        await SendMessageAsync(message.ToString(), cancellationToken);
+    }
+
+    public async Task SendPositionClosedAsync(Position position, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
+        {
+            logger.LogWarning("Telegram position-close notification skipped because bot configuration is missing.");
+            return;
+        }
+
+        var message = new StringBuilder();
+        message.AppendLine("📤 Paper Position Closed");
+        message.AppendLine();
+        message.AppendLine($"Symbol: {position.Symbol}");
+        message.AppendLine($"Entry Price: {FormatDecimal(position.EntryPrice)}");
+        message.AppendLine($"Exit Price: {FormatDecimal(position.ExitPrice)}");
+        message.AppendLine();
+        message.AppendLine("P/L:");
+        message.AppendLine(FormatDecimal(position.ProfitLoss));
+        message.AppendLine();
+        message.AppendLine("P/L %:");
+        message.AppendLine(position.ProfitLossPercent.HasValue ? $"{FormatDecimal(position.ProfitLossPercent)}%" : "N/A");
+
+        await SendMessageAsync(message.ToString(), cancellationToken);
     }
 
     public async Task<TelegramTestResult> SendTestAsync(CancellationToken cancellationToken)
@@ -95,13 +147,14 @@ public sealed class TelegramNotificationService(
 
     private static string BuildMessage(TradingSignal signal, bool usedFallback)
     {
+        var market = signal.MarketData;
         var builder = new StringBuilder();
         builder.AppendLine("📈 Trading Signal");
         builder.AppendLine();
         builder.AppendLine($"Symbol: {signal.Symbol}");
         builder.AppendLine($"Timeframe: {signal.Timeframe ?? "N/A"}");
         builder.AppendLine();
-        builder.AppendLine($"Original Signal: {signal.OriginalSignal}");
+        builder.AppendLine($"TradingView Signal: {signal.OriginalSignal}");
         builder.AppendLine();
         builder.AppendLine($"Claude Decision: {signal.ClaudeAction ?? "N/A"}");
         builder.AppendLine();
@@ -109,14 +162,25 @@ public sealed class TelegramNotificationService(
         builder.AppendLine();
         builder.AppendLine($"Risk: {signal.RiskLevel ?? "N/A"}");
         builder.AppendLine();
-        builder.AppendLine("Entry:");
-        builder.AppendLine(FormatDecimal(signal.Price));
+        builder.AppendLine($"RSI: {FormatDecimal(market?.Rsi14)}");
+        builder.AppendLine();
+        builder.AppendLine("EMA:");
+        builder.AppendLine($"  9: {FormatDecimal(market?.Ema9)}");
+        builder.AppendLine($"  20: {FormatDecimal(market?.Ema20)}");
+        builder.AppendLine($"  50: {FormatDecimal(market?.Ema50)}");
+        builder.AppendLine();
+        builder.AppendLine("Volume:");
+        builder.AppendLine($"  Current: {FormatVolume(market?.CurrentVolume)}");
+        builder.AppendLine($"  Avg 20: {FormatVolume(market?.AverageVolume20)}");
+        builder.AppendLine($"  Spike: {FormatVolumeSpike(market?.CurrentVolume, market?.AverageVolume20)}");
         builder.AppendLine();
         builder.AppendLine("Stop Loss:");
         builder.AppendLine(FormatDecimal(signal.SuggestedStopLoss));
         builder.AppendLine();
         builder.AppendLine("Take Profit:");
         builder.AppendLine(FormatDecimal(signal.SuggestedTakeProfit));
+        builder.AppendLine();
+        builder.AppendLine($"Risk/Reward: {FormatDecimal(signal.RiskRewardRatio)}");
         builder.AppendLine();
         builder.AppendLine("Reason:");
 
@@ -134,4 +198,18 @@ public sealed class TelegramNotificationService(
 
     private static string FormatDecimal(decimal? value)
         => value.HasValue ? value.Value.ToString("0.####", CultureInfo.InvariantCulture) : "N/A";
+
+    private static string FormatVolume(long? value)
+        => value.HasValue ? value.Value.ToString("N0", CultureInfo.InvariantCulture) : "N/A";
+
+    private static string FormatVolumeSpike(long? currentVolume, long? averageVolume)
+    {
+        if (!currentVolume.HasValue || !averageVolume.HasValue || averageVolume.Value == 0)
+        {
+            return "N/A";
+        }
+
+        var spikePercent = ((decimal)currentVolume.Value / averageVolume.Value - 1m) * 100m;
+        return $"{spikePercent:0.#}%";
+    }
 }

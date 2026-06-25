@@ -10,4 +10,10 @@ public sealed class AppSettings
     public string DatabasePath { get; set; } = "/app/data/tradingagent.db";
     public int RetentionDays { get; set; } = 30;
     public string WebhookSecret { get; set; } = string.Empty;
+    public int MinConfidenceToNotify { get; set; } = 70;
+    public bool SendIgnoredSignals { get; set; }
+    public bool PaperTradingEnabled { get; set; } = true;
+    public decimal DefaultPositionQuantity { get; set; } = 1;
+    public bool AllowTestTrades { get; set; }
+    public bool SendTestTelegram { get; set; }
 }
