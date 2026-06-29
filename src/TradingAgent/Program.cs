@@ -7,6 +7,7 @@ using TradingAgent.Data;
 using TradingAgent.DTOs;
 using TradingAgent.Models;
 using TradingAgent.Services;
+using TradingAgent.Services.Market;
 
 DotEnvLoader.Load();
 
@@ -44,7 +45,32 @@ builder.Services.AddSingleton(sp =>
             ? quantity
             : 1,
         AllowTestTrades = bool.TryParse(configuration["ALLOW_TEST_TRADES"], out var allowTestTrades) && allowTestTrades,
-        SendTestTelegram = bool.TryParse(configuration["SEND_TEST_TELEGRAM"], out var sendTestTelegram) && sendTestTelegram
+        SendTestTelegram = bool.TryParse(configuration["SEND_TEST_TELEGRAM"], out var sendTestTelegram) && sendTestTelegram,
+        MarketProvider = configuration["MARKET_PROVIDER"] ?? "NASDAQ",
+        MarketTimezone = configuration["MARKET_TIMEZONE"] ?? "America/New_York",
+        AllowPreMarket = bool.TryParse(configuration["ALLOW_PREMARKET"], out var allowPreMarket) && allowPreMarket,
+        AllowAfterHours = bool.TryParse(configuration["ALLOW_AFTER_HOURS"], out var allowAfterHours) && allowAfterHours,
+        AllowOvernight = bool.TryParse(configuration["ALLOW_OVERNIGHT"], out var allowOvernight) && allowOvernight,
+        IgnoreSignalsWhenMarketClosed = !bool.TryParse(configuration["IGNORE_SIGNALS_WHEN_MARKET_CLOSED"], out var ignoreWhenClosed) || ignoreWhenClosed,
+        SendMarketClosedNotifications = bool.TryParse(configuration["SEND_MARKET_CLOSED_NOTIFICATIONS"], out var sendMarketClosed) && sendMarketClosed,
+        Enable24_5Trading = !bool.TryParse(configuration["ENABLE_24_5_TRADING"], out var enable24_5) || enable24_5,
+        MinConfidenceRegular = int.TryParse(configuration["MIN_CONFIDENCE_REGULAR"], out var minConfRegular)
+            ? Math.Clamp(minConfRegular, 0, 100)
+            : 70,
+        MinConfidencePremarket = int.TryParse(configuration["MIN_CONFIDENCE_PREMARKET"], out var minConfPremarket)
+            ? Math.Clamp(minConfPremarket, 0, 100)
+            : 85,
+        MinConfidenceAfterHours = int.TryParse(configuration["MIN_CONFIDENCE_AFTER_HOURS"], out var minConfAfterHours)
+            ? Math.Clamp(minConfAfterHours, 0, 100)
+            : 85,
+        MinConfidenceOvernight = int.TryParse(configuration["MIN_CONFIDENCE_OVERNIGHT"], out var minConfOvernight)
+            ? Math.Clamp(minConfOvernight, 0, 100)
+            : 90,
+        AllowScaleIn = bool.TryParse(configuration["ALLOW_SCALE_IN"], out var allowScaleIn) && allowScaleIn,
+        MaxPositionsPerSymbol = int.TryParse(configuration["MAX_POSITIONS_PER_SYMBOL"], out var maxPositions) && maxPositions > 0
+            ? maxPositions
+            : 1,
+        SendDuplicateBuyNotifications = bool.TryParse(configuration["SEND_DUPLICATE_BUY_NOTIFICATIONS"], out var sendDuplicateBuy) && sendDuplicateBuy
     };
 });
 
@@ -83,6 +109,12 @@ builder.Services.AddScoped<ITelegramNotificationService, TelegramNotificationSer
 builder.Services.AddScoped<IYahooFinanceService, YahooFinanceService>();
 builder.Services.AddScoped<IPositionManagerService, PositionManagerService>();
 builder.Services.AddScoped<IWebhookProcessorService, WebhookProcessorService>();
+builder.Services.AddSingleton<IMarketCalendarService, MarketCalendarService>();
+builder.Services.AddSingleton<IMarketProvider, NasdaqMarketProvider>();
+builder.Services.AddSingleton<IMarketProvider, NyseMarketProvider>();
+builder.Services.AddSingleton<IMarketProvider, CryptoMarketProvider>();
+builder.Services.AddSingleton<IMarketProvider, ForexMarketProvider>();
+builder.Services.AddScoped<IMarketStatusService, MarketStatusService>();
 builder.Services.AddHostedService<SignalRetentionCleanupService>();
 
 var app = builder.Build();
@@ -161,6 +193,18 @@ api.MapGet("/webhooks/history/{id:int}", GetWebhookHistoryByIdAsync)
 api.MapDelete("/webhooks/history", DeleteWebhookHistoryAsync)
     .WithName("DeleteWebhookHistory");
 
+api.MapGet("/market/status", GetMarketStatusAsync)
+    .WithName("GetMarketStatus");
+
+api.MapGet("/market/status/{market}", GetMarketStatusByNameAsync)
+    .WithName("GetMarketStatusByName");
+
+api.MapGet("/market/calendar", GetMarketCalendarAsync)
+    .WithName("GetMarketCalendar");
+
+api.MapGet("/test-market", TestMarketAsync)
+    .WithName("TestMarket");
+
 app.MapFallbackToFile("index.html");
 
 app.Run();
@@ -173,8 +217,10 @@ static async Task EnsureDatabaseAsync(WebApplication app)
     await EnsureSignalMarketDataTableAsync(dbContext);
     await EnsureTradingSignalColumnsAsync(dbContext);
     await EnsurePositionsTableAsync(dbContext);
+    await EnsurePositionColumnsAsync(dbContext);
     await EnsureWebhookRequestLogsTableAsync(dbContext);
     await EnsureTradingSignalAuditColumnsAsync(dbContext);
+    await EnsureTradingSignalMarketColumnsAsync(dbContext);
 }
 
 static async Task EnsureSignalMarketDataTableAsync(TradingAgentDbContext dbContext)
@@ -278,6 +324,32 @@ static async Task EnsurePositionsTableAsync(TradingAgentDbContext dbContext)
         """);
 }
 
+static async Task EnsurePositionColumnsAsync(TradingAgentDbContext dbContext)
+{
+    var connection = dbContext.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+    {
+        await connection.OpenAsync();
+    }
+
+    var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    await using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "PRAGMA table_info(Positions);";
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            existingColumns.Add(reader.GetString(1));
+        }
+    }
+
+    if (!existingColumns.Contains("EntryMarketSession"))
+    {
+        await dbContext.Database.ExecuteSqlRawAsync(
+            "ALTER TABLE Positions ADD COLUMN EntryMarketSession TEXT NULL;");
+    }
+}
+
 static async Task EnsureWebhookRequestLogsTableAsync(TradingAgentDbContext dbContext)
 {
     await dbContext.Database.ExecuteSqlRawAsync("""
@@ -328,6 +400,44 @@ static async Task EnsureTradingSignalAuditColumnsAsync(TradingAgentDbContext dbC
     {
         ["IsTest"] = "ALTER TABLE TradingSignals ADD COLUMN IsTest INTEGER NOT NULL DEFAULT 0;",
         ["Source"] = "ALTER TABLE TradingSignals ADD COLUMN Source TEXT NOT NULL DEFAULT 'UNKNOWN';"
+    };
+
+    foreach (var (column, sql) in migrations)
+    {
+        if (!existingColumns.Contains(column))
+        {
+            await dbContext.Database.ExecuteSqlRawAsync(sql);
+        }
+    }
+}
+
+static async Task EnsureTradingSignalMarketColumnsAsync(TradingAgentDbContext dbContext)
+{
+    var connection = dbContext.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+    {
+        await connection.OpenAsync();
+    }
+
+    var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    await using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "PRAGMA table_info(TradingSignals);";
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            existingColumns.Add(reader.GetString(1));
+        }
+    }
+
+    var migrations = new Dictionary<string, string>
+    {
+        ["IgnoredReason"] = "ALTER TABLE TradingSignals ADD COLUMN IgnoredReason TEXT NULL;",
+        ["IgnoredBy"] = "ALTER TABLE TradingSignals ADD COLUMN IgnoredBy TEXT NULL;",
+        ["MarketStatus"] = "ALTER TABLE TradingSignals ADD COLUMN MarketStatus TEXT NULL;",
+        ["MarketName"] = "ALTER TABLE TradingSignals ADD COLUMN MarketName TEXT NULL;",
+        ["MarketCheckedAtUtc"] = "ALTER TABLE TradingSignals ADD COLUMN MarketCheckedAtUtc TEXT NULL;",
+        ["MarketSession"] = "ALTER TABLE TradingSignals ADD COLUMN MarketSession TEXT NULL;"
     };
 
     foreach (var (column, sql) in migrations)
@@ -627,8 +737,50 @@ static IResult GetSettingsAsync(AppSettings settings)
         ["PAPER_TRADING_ENABLED"] = settings.PaperTradingEnabled,
         ["DEFAULT_POSITION_QUANTITY"] = settings.DefaultPositionQuantity,
         ["ALLOW_TEST_TRADES"] = settings.AllowTestTrades,
-        ["SEND_TEST_TELEGRAM"] = settings.SendTestTelegram
+        ["SEND_TEST_TELEGRAM"] = settings.SendTestTelegram,
+        ["MARKET_PROVIDER"] = settings.MarketProvider,
+        ["MARKET_TIMEZONE"] = settings.MarketTimezone,
+        ["ALLOW_PREMARKET"] = settings.AllowPreMarket,
+        ["ALLOW_AFTER_HOURS"] = settings.AllowAfterHours,
+        ["ALLOW_OVERNIGHT"] = settings.AllowOvernight,
+        ["IGNORE_SIGNALS_WHEN_MARKET_CLOSED"] = settings.IgnoreSignalsWhenMarketClosed,
+        ["SEND_MARKET_CLOSED_NOTIFICATIONS"] = settings.SendMarketClosedNotifications,
+        ["ENABLE_24_5_TRADING"] = settings.Enable24_5Trading,
+        ["MIN_CONFIDENCE_REGULAR"] = settings.MinConfidenceRegular,
+        ["MIN_CONFIDENCE_PREMARKET"] = settings.MinConfidencePremarket,
+        ["MIN_CONFIDENCE_AFTER_HOURS"] = settings.MinConfidenceAfterHours,
+        ["MIN_CONFIDENCE_OVERNIGHT"] = settings.MinConfidenceOvernight,
+        ["ALLOW_SCALE_IN"] = settings.AllowScaleIn,
+        ["MAX_POSITIONS_PER_SYMBOL"] = settings.MaxPositionsPerSymbol,
+        ["SEND_DUPLICATE_BUY_NOTIFICATIONS"] = settings.SendDuplicateBuyNotifications
     });
+
+static IResult GetMarketStatusAsync(IMarketStatusService marketStatusService)
+    => TypedResults.Ok(marketStatusService.GetStatus());
+
+static IResult GetMarketStatusByNameAsync(string market, IMarketStatusService marketStatusService)
+    => TypedResults.Ok(marketStatusService.GetStatus(market));
+
+static IResult GetMarketCalendarAsync(IMarketStatusService marketStatusService, int? year)
+    => TypedResults.Ok(marketStatusService.GetCalendar(year: year));
+
+static IResult TestMarketAsync(
+    IMarketStatusService marketStatusService,
+    string? datetimeUtc,
+    string? market)
+{
+    DateTime? atUtc = null;
+    if (!string.IsNullOrWhiteSpace(datetimeUtc)
+        && DateTime.TryParse(datetimeUtc, null, System.Globalization.DateTimeStyles.RoundtripKind, out var parsed))
+    {
+        atUtc = parsed.Kind == DateTimeKind.Unspecified
+            ? DateTime.SpecifyKind(parsed, DateTimeKind.Utc)
+            : parsed.ToUniversalTime();
+    }
+
+    var status = marketStatusService.GetStatus(market, atUtc);
+    return TypedResults.Ok(status);
+}
 
 static async Task<Ok<List<Position>>> GetPositionsAsync(
     TradingAgentDbContext dbContext,

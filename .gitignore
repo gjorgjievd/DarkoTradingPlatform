@@ -189,6 +189,9 @@ publish/
 
 # Publish Web Output
 *.[Pp]ublish.xml
+deploy-package/
+TradingAgentDeploy.zip
+TradingAgent_Deployment_*.zip
 *.azurePubxml
 # Note: Comment the next line if you want to checkin your web deploy settings,
 # but database connection strings (with potential passwords) will be unencrypted

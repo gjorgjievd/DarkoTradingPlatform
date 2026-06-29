@@ -2,6 +2,7 @@ using System.Globalization;
 using System.Text;
 using System.Text.Json;
 using TradingAgent.Configuration;
+using TradingAgent.DTOs;
 using TradingAgent.Models;
 
 namespace TradingAgent.Services;
@@ -13,7 +14,12 @@ public sealed class TelegramNotificationService(
 {
     public const string HttpClientName = "telegram";
 
-    public async Task SendSignalAsync(TradingSignal signal, bool usedFallback, bool isTest, CancellationToken cancellationToken)
+    public async Task SendSignalAsync(
+        TradingSignal signal,
+        bool usedFallback,
+        bool isTest,
+        MarketStatusDto marketStatus,
+        CancellationToken cancellationToken)
     {
         if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
         {
@@ -21,13 +27,55 @@ public sealed class TelegramNotificationService(
             return;
         }
 
-        var message = BuildMessage(signal, usedFallback);
+        var message = BuildMessage(signal, usedFallback, marketStatus);
         if (isTest)
         {
             message = $"🧪 TEST\n{message}";
         }
 
         await SendMessageAsync(message, cancellationToken);
+    }
+
+    public async Task SendDuplicateBuyAsync(TradingSignal signal, MarketStatusDto marketStatus, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
+        {
+            logger.LogWarning("Duplicate BUY Telegram notification skipped because bot configuration is missing.");
+            return;
+        }
+
+        var message = new StringBuilder();
+        message.AppendLine("Duplicate BUY - Signal ignored");
+        message.AppendLine();
+        message.AppendLine($"Symbol: {signal.Symbol}");
+        message.AppendLine($"Original Signal: {signal.OriginalSignal}");
+        message.AppendLine($"Claude Decision: {signal.ClaudeAction ?? "N/A"}");
+        message.AppendLine($"Reason: {signal.IgnoredReason ?? "Position already open"}");
+        message.AppendLine($"Market Session: {marketStatus.MarketSession}");
+        message.AppendLine($"Confidence Threshold Used: {marketStatus.SessionConfidenceThreshold}");
+
+        await SendMessageAsync(message.ToString(), cancellationToken);
+    }
+
+    public async Task SendMarketClosedAsync(TradingSignal signal, MarketStatusDto marketStatus, CancellationToken cancellationToken)
+    {
+        if (string.IsNullOrWhiteSpace(settings.TelegramBotToken) || string.IsNullOrWhiteSpace(settings.TelegramChatId))
+        {
+            logger.LogWarning("Market closed Telegram notification skipped because bot configuration is missing.");
+            return;
+        }
+
+        var message = new StringBuilder();
+        message.AppendLine("Market Closed - Signal ignored");
+        message.AppendLine();
+        message.AppendLine($"Symbol: {signal.Symbol}");
+        message.AppendLine($"Original Signal: {signal.OriginalSignal}");
+        message.AppendLine($"Market: {marketStatus.MarketName}");
+        message.AppendLine($"Status: {marketStatus.Status}");
+        message.AppendLine($"Reason: {signal.IgnoredReason ?? marketStatus.Reason ?? "Market closed"}");
+        message.AppendLine($"Next Open: {FormatNextOpen(marketStatus.NextOpenTimeUtc)}");
+
+        await SendMessageAsync(message.ToString(), cancellationToken);
     }
 
     public async Task SendPositionOpenedAsync(Position position, CancellationToken cancellationToken)
@@ -145,7 +193,7 @@ public sealed class TelegramNotificationService(
         }
     }
 
-    private static string BuildMessage(TradingSignal signal, bool usedFallback)
+    private static string BuildMessage(TradingSignal signal, bool usedFallback, MarketStatusDto marketStatus)
     {
         var market = signal.MarketData;
         var builder = new StringBuilder();
@@ -153,6 +201,9 @@ public sealed class TelegramNotificationService(
         builder.AppendLine();
         builder.AppendLine($"Symbol: {signal.Symbol}");
         builder.AppendLine($"Timeframe: {signal.Timeframe ?? "N/A"}");
+        builder.AppendLine();
+        builder.AppendLine($"Market Session: {marketStatus.MarketSession}");
+        builder.AppendLine($"Confidence Threshold Used: {marketStatus.SessionConfidenceThreshold}");
         builder.AppendLine();
         builder.AppendLine($"TradingView Signal: {signal.OriginalSignal}");
         builder.AppendLine();
@@ -212,4 +263,7 @@ public sealed class TelegramNotificationService(
         var spikePercent = ((decimal)currentVolume.Value / averageVolume.Value - 1m) * 100m;
         return $"{spikePercent:0.#}%";
     }
+
+    private static string FormatNextOpen(DateTime? nextOpenUtc)
+        => nextOpenUtc.HasValue ? nextOpenUtc.Value.ToString("u", CultureInfo.InvariantCulture) : "N/A";
 }

@@ -26,5 +26,17 @@ public sealed class TradingSignal
     public decimal? ProfitLoss { get; set; }
     public string? Notes { get; set; }
     public bool IsClosed { get; set; }
+    public string? IgnoredReason { get; set; }
+    public string? IgnoredBy { get; set; }
+    public string? MarketStatus { get; set; }
+    public string? MarketSession { get; set; }
+    public string? MarketName { get; set; }
+    public DateTime? MarketCheckedAtUtc { get; set; }
     public SignalMarketData? MarketData { get; set; }
+}
+
+public static class SignalIgnoredBy
+{
+    public const string MarketStatus = "MarketStatus";
+    public const string PositionRules = "PositionRules";
 }

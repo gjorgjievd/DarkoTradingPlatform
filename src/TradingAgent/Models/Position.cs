@@ -21,5 +21,6 @@ public sealed class Position
     public decimal? ProfitLoss { get; set; }
     public decimal? ProfitLossPercent { get; set; }
     public decimal? MaxRiskPercent { get; set; }
+    public string? EntryMarketSession { get; set; }
     public string? Notes { get; set; }
 }

@@ -1,10 +1,14 @@
 using TradingAgent.Configuration;
+using TradingAgent.DTOs;
 
 namespace TradingAgent.Services;
 
 internal static class NotificationFilter
 {
-    public static bool ShouldSendTelegram(AppSettings settings, ClaudeAnalysisResponse response)
+    public static bool ShouldSendTelegram(
+        AppSettings settings,
+        ClaudeAnalysisResponse response,
+        MarketStatusDto marketStatus)
     {
         if (settings.SendIgnoredSignals)
         {
@@ -17,7 +21,8 @@ internal static class NotificationFilter
         }
 
         var analysis = response.Analysis;
+        var threshold = marketStatus.SessionConfidenceThreshold;
         return analysis.ShouldNotify == true
-            && analysis.Confidence >= settings.MinConfidenceToNotify;
+            && analysis.Confidence >= threshold;
     }
 }

@@ -144,6 +144,11 @@
             </div>
         </div>
 
+        <div class="panel">
+            <h2>Market Status</h2>
+            <div class="cards" id="marketStatusCards"></div>
+        </div>
+
         <div class="cards" id="performanceCards"></div>
 
         <div class="cards" id="summaryCards"></div>
@@ -157,6 +162,7 @@
                             <th>ID</th>
                             <th>Symbol</th>
                             <th>Entry</th>
+                            <th>Session</th>
                             <th>Quantity</th>
                             <th>Risk</th>
                             <th>Actions</th>
@@ -224,8 +230,10 @@
                             <th>ID</th>
                             <th>Signal</th>
                             <th>Claude Filter</th>
-                            <th>Market</th>
+                            <th>Market Status</th>
+                            <th>Market Data</th>
                             <th>Reason</th>
+                            <th>Ignored Reason</th>
                             <th>Trade details</th>
                             <th>Edit</th>
                         </tr>
@@ -238,6 +246,7 @@
 
     <script>
         const statusElement = document.getElementById('status');
+        const marketStatusCards = document.getElementById('marketStatusCards');
         const performanceCards = document.getElementById('performanceCards');
         const summaryCards = document.getElementById('summaryCards');
         const openPositionsBody = document.getElementById('openPositionsBody');
@@ -264,10 +273,11 @@
             const signalsUrl = symbol ? `/api/signals?symbol=${encodeURIComponent(symbol)}` : '/api/signals';
 
             try {
-                const [signalsResponse, openResponse, closedResponse] = await Promise.all([
+                const [signalsResponse, openResponse, closedResponse, marketResponse] = await Promise.all([
                     fetch(signalsUrl),
                     fetch('/api/positions/open'),
-                    fetch('/api/positions/closed')
+                    fetch('/api/positions/closed'),
+                    fetch('/api/market/status')
                 ]);
 
                 if (!signalsResponse.ok || !openResponse.ok || !closedResponse.ok) {
@@ -277,6 +287,7 @@
                 let signals = await signalsResponse.json();
                 const openPositions = await openResponse.json();
                 const closedPositions = await closedResponse.json();
+                const marketStatus = marketResponse.ok ? await marketResponse.json() : null;
 
                 const typeFilter = signalFilter.value;
                 if (typeFilter === 'real') {
@@ -285,6 +296,7 @@
                     signals = signals.filter(signal => signal.isTest);
                 }
 
+                renderMarketStatus(marketStatus);
                 renderPerformance(closedPositions);
                 renderSummary(signals);
                 renderOpenPositions(openPositions);
@@ -332,6 +344,36 @@
             `).join('');
         }
 
+        function renderMarketStatus(marketStatus) {
+            if (!marketStatus) {
+                marketStatusCards.innerHTML = '<div class="card">Market status unavailable.</div>';
+                return;
+            }
+
+            const cards = [
+                ['Market', marketStatus.marketName],
+                ['Session', marketStatus.marketSession || marketStatus.status],
+                ['Confidence Threshold', marketStatus.sessionConfidenceThreshold],
+                ['Status', marketStatus.status],
+                ['Market Time', formatDate(marketStatus.currentMarketTime)],
+                ['Is Open', marketStatus.isOpen ? 'Yes' : 'No'],
+                ['Pre-market', marketStatus.isPreMarket ? 'Yes' : 'No'],
+                ['After-hours', marketStatus.isAfterHours ? 'Yes' : 'No'],
+                ['Overnight', marketStatus.isOvernight ? 'Yes' : 'No'],
+                ['Weekend', marketStatus.isWeekend ? 'Yes' : 'No'],
+                ['Holiday', marketStatus.isHoliday ? 'Yes' : 'No'],
+                ['Next Open', formatDate(marketStatus.nextOpenTimeUtc)],
+                ['Next Close', formatDate(marketStatus.nextCloseTimeUtc)]
+            ];
+
+            marketStatusCards.innerHTML = cards.map(([label, value]) => `
+                <div class="card">
+                    <div>${label}</div>
+                    <strong style="font-size: 1.1rem;">${escapeHtml(String(value))}</strong>
+                </div>
+            `).join('');
+        }
+
         function renderPerformance(closedPositions) {
             const wins = closedPositions.filter(position => typeof position.profitLoss === 'number' && position.profitLoss > 0);
             const losses = closedPositions.filter(position => typeof position.profitLoss === 'number' && position.profitLoss < 0);
@@ -357,7 +399,7 @@
 
         function renderOpenPositions(positions) {
             if (positions.length === 0) {
-                openPositionsBody.innerHTML = '<tr><td colspan="6">No open positions.</td></tr>';
+                openPositionsBody.innerHTML = '<tr><td colspan="7">No open positions.</td></tr>';
                 return;
             }
 
@@ -369,6 +411,7 @@
                         ${formatValue(position.entryPrice)}<br />
                         <span class="pill">${formatDate(position.entryTimeUtc)}</span>
                     </td>
+                    <td>${position.entryMarketSession || '—'}</td>
                     <td>${formatValue(position.quantity)}</td>
                     <td>${formatValue(position.maxRiskPercent)}%</td>
                     <td>
@@ -478,7 +521,7 @@
 
         function renderSignals(signals) {
             if (signals.length === 0) {
-                signalsBody.innerHTML = '<tr><td colspan="7">No signals found.</td></tr>';
+                signalsBody.innerHTML = '<tr><td colspan="9">No signals found.</td></tr>';
                 return;
             }
 
@@ -500,6 +543,12 @@
                         Notified: ${signal.notified ? 'Yes' : 'No'}
                     </td>
                     <td>
+                        ${signal.marketName || 'N/A'}<br />
+                        Session: ${signal.marketSession || signal.marketStatus || 'N/A'}<br />
+                        Status: ${signal.marketStatus || 'N/A'}<br />
+                        Checked: ${formatDate(signal.marketCheckedAtUtc)}
+                    </td>
+                    <td>
                         RSI: ${formatValue(signal.marketData?.rsi14)}<br />
                         EMA9: ${formatValue(signal.marketData?.ema9)}<br />
                         EMA20: ${formatValue(signal.marketData?.ema20)}<br />
@@ -507,6 +556,7 @@
                         Vol Spike: ${formatVolumeSpike(signal.marketData?.currentVolume, signal.marketData?.averageVolume20)}
                     </td>
                     <td>${escapeHtml(signal.shortReason || 'No analysis captured.')}</td>
+                    <td>${escapeHtml(signal.ignoredReason || 'N/A')}</td>
                     <td>
                         Price: ${formatValue(signal.price)}<br />
                         Stop Loss: ${formatValue(signal.suggestedStopLoss)}<br />

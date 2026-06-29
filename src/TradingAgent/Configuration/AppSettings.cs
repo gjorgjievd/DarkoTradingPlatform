@@ -16,4 +16,19 @@ public sealed class AppSettings
     public decimal DefaultPositionQuantity { get; set; } = 1;
     public bool AllowTestTrades { get; set; }
     public bool SendTestTelegram { get; set; }
+    public string MarketProvider { get; set; } = "NASDAQ";
+    public string MarketTimezone { get; set; } = "America/New_York";
+    public bool AllowPreMarket { get; set; }
+    public bool AllowAfterHours { get; set; }
+    public bool AllowOvernight { get; set; }
+    public bool IgnoreSignalsWhenMarketClosed { get; set; } = true;
+    public bool SendMarketClosedNotifications { get; set; }
+    public bool Enable24_5Trading { get; set; } = true;
+    public int MinConfidenceRegular { get; set; } = 70;
+    public int MinConfidencePremarket { get; set; } = 85;
+    public int MinConfidenceAfterHours { get; set; } = 85;
+    public int MinConfidenceOvernight { get; set; } = 90;
+    public bool AllowScaleIn { get; set; }
+    public int MaxPositionsPerSymbol { get; set; } = 1;
+    public bool SendDuplicateBuyNotifications { get; set; }
 }

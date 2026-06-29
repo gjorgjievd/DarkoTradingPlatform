@@ -1,9 +1,11 @@
 using System.Globalization;
 using System.Text.Json;
+using Microsoft.EntityFrameworkCore;
 using TradingAgent.Configuration;
 using TradingAgent.Data;
 using TradingAgent.DTOs;
 using TradingAgent.Models;
+using TradingAgent.Services.Market;
 
 namespace TradingAgent.Services;
 
@@ -22,6 +24,7 @@ public sealed class WebhookProcessorService(
     ITelegramNotificationService telegramNotificationService,
     IYahooFinanceService yahooFinanceService,
     IPositionManagerService positionManagerService,
+    IMarketStatusService marketStatusService,
     AppSettings settings,
     ILogger<WebhookProcessorService> logger) : IWebhookProcessorService
 {
@@ -111,13 +114,62 @@ public sealed class WebhookProcessorService(
             webhookLog.TradingSignalId = tradingSignal.Id;
             await dbContext.SaveChangesAsync(cancellationToken);
 
+            var marketStatus = marketStatusService.GetStatus();
+            tradingSignal.MarketName = marketStatus.MarketName;
+            tradingSignal.MarketStatus = marketStatus.Status;
+            tradingSignal.MarketSession = marketStatus.MarketSession;
+            tradingSignal.MarketCheckedAtUtc = marketStatus.CheckedAtUtc;
+
+            if (marketStatusService.ShouldIgnoreSignal(marketStatus))
+            {
+                tradingSignal.ClaudeAction = "IGNORE";
+                tradingSignal.ShortReason = "Market closed";
+                tradingSignal.IgnoredReason = marketStatusService.GetIgnoredReason(marketStatus);
+                tradingSignal.IgnoredBy = SignalIgnoredBy.MarketStatus;
+                tradingSignal.ShouldNotify = false;
+                tradingSignal.Notified = false;
+
+                await dbContext.SaveChangesAsync(cancellationToken);
+
+                if (settings.SendMarketClosedNotifications && !isTest)
+                {
+                    await telegramNotificationService.SendMarketClosedAsync(tradingSignal, marketStatus, cancellationToken);
+                    tradingSignal.Notified = true;
+                    await dbContext.SaveChangesAsync(cancellationToken);
+                }
+
+                logger.LogInformation(
+                    "Signal {SignalId} ignored due to market status. Market={Market}, Status={Status}, Reason={Reason}",
+                    tradingSignal.Id,
+                    marketStatus.MarketName,
+                    marketStatus.Status,
+                    tradingSignal.IgnoredReason);
+
+                webhookLog.ResultStatus = "SUCCESS";
+                webhookLog.ErrorMessage = null;
+                await dbContext.SaveChangesAsync(cancellationToken);
+
+                return new WebhookProcessResponse
+                {
+                    Success = true,
+                    WebhookLogId = webhookLog.Id,
+                    SignalId = tradingSignal.Id,
+                    Source = source,
+                    IsTest = isTest,
+                    ResultStatus = webhookLog.ResultStatus,
+                    Signal = tradingSignal,
+                    MarketIgnored = true,
+                    MarketStatus = marketStatus
+                };
+            }
+
             var marketContext = await yahooFinanceService.FetchMarketContextAsync(tradingSignal.Symbol, cancellationToken);
             var marketDataEntity = MarketContextMapper.ToEntity(marketContext, tradingSignal.Id);
             dbContext.SignalMarketData.Add(marketDataEntity);
             await dbContext.SaveChangesAsync(cancellationToken);
             tradingSignal.MarketData = marketDataEntity;
 
-            var analysisResponse = await claudeAnalysisService.AnalyzeAsync(payload, marketContext, cancellationToken);
+            var analysisResponse = await claudeAnalysisService.AnalyzeAsync(payload, marketContext, marketStatus, cancellationToken);
 
             tradingSignal.ClaudeAction = analysisResponse.Analysis?.Action;
             tradingSignal.Confidence = analysisResponse.Analysis?.Confidence;
@@ -134,17 +186,24 @@ public sealed class WebhookProcessorService(
 
             await dbContext.SaveChangesAsync(cancellationToken);
 
-            var sendTelegram = !isTest && NotificationFilter.ShouldSendTelegram(settings, analysisResponse);
-            var sendTestTelegram = isTest && settings.SendTestTelegram;
+            var duplicateBuyBlocked = await TryBlockDuplicateBuyAsync(tradingSignal, analysisResponse, cancellationToken);
+
+            var sendTelegram = !duplicateBuyBlocked && !isTest && NotificationFilter.ShouldSendTelegram(settings, analysisResponse, marketStatus);
+            var sendTestTelegram = !duplicateBuyBlocked && isTest && settings.SendTestTelegram;
 
             if (sendTelegram)
             {
-                await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, isTest: false, cancellationToken);
+                await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, isTest: false, marketStatus, cancellationToken);
                 tradingSignal.Notified = true;
             }
             else if (sendTestTelegram)
             {
-                await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, isTest: true, cancellationToken);
+                await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, isTest: true, marketStatus, cancellationToken);
+                tradingSignal.Notified = true;
+            }
+            else if (duplicateBuyBlocked && settings.SendDuplicateBuyNotifications && !isTest)
+            {
+                await telegramNotificationService.SendDuplicateBuyAsync(tradingSignal, marketStatus, cancellationToken);
                 tradingSignal.Notified = true;
             }
             else
@@ -211,6 +270,50 @@ public sealed class WebhookProcessorService(
             logger.LogError(exception, "Webhook processing failed for log {WebhookLogId}.", webhookLog.Id);
             return await FailAsync(webhookLog, "ERROR", "Webhook processing failed unexpectedly.", cancellationToken);
         }
+    }
+
+    private async Task<bool> TryBlockDuplicateBuyAsync(
+        TradingSignal tradingSignal,
+        ClaudeAnalysisResponse analysisResponse,
+        CancellationToken cancellationToken)
+    {
+        if (settings.AllowScaleIn)
+        {
+            return false;
+        }
+
+        if (!string.Equals(analysisResponse.Analysis?.Action, "BUY", StringComparison.OrdinalIgnoreCase))
+        {
+            return false;
+        }
+
+        var openPositionCount = await dbContext.Positions.CountAsync(
+            position => position.Symbol == tradingSignal.Symbol && position.Status == PositionStatus.Open,
+            cancellationToken);
+
+        if (openPositionCount < settings.MaxPositionsPerSymbol)
+        {
+            return false;
+        }
+
+        tradingSignal.IgnoredReason = "Position already open";
+        tradingSignal.IgnoredBy = SignalIgnoredBy.PositionRules;
+        tradingSignal.ShouldNotify = false;
+
+        if (string.IsNullOrWhiteSpace(tradingSignal.ShortReason))
+        {
+            tradingSignal.ShortReason = "Position already open";
+        }
+
+        await dbContext.SaveChangesAsync(cancellationToken);
+
+        logger.LogInformation(
+            "Signal {SignalId} blocked by position rules. Symbol={Symbol}, OpenPositions={Count}",
+            tradingSignal.Id,
+            tradingSignal.Symbol,
+            openPositionCount);
+
+        return true;
     }
 
     private async Task<WebhookProcessResponse> FailAsync(

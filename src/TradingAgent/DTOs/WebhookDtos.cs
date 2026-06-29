@@ -19,4 +19,6 @@ public sealed class WebhookProcessResponse
     public string? ResultStatus { get; init; }
     public string? Error { get; init; }
     public object? Signal { get; init; }
+    public bool MarketIgnored { get; init; }
+    public MarketStatusDto? MarketStatus { get; init; }
 }

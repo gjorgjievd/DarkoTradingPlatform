@@ -92,13 +92,15 @@ public sealed class PositionManagerService(
             };
         }
 
-        var hasOpenPosition = await dbContext.Positions.AnyAsync(
+        var openPositionCount = await dbContext.Positions.CountAsync(
             position => position.Symbol == signal.Symbol && position.Status == PositionStatus.Open,
             cancellationToken);
 
-        if (hasOpenPosition)
+        if (openPositionCount >= settings.MaxPositionsPerSymbol)
         {
-            var reason = $"Paper trade skipped: OPEN position already exists for {signal.Symbol}.";
+            var reason = settings.AllowScaleIn
+                ? $"Paper trade skipped: max positions ({settings.MaxPositionsPerSymbol}) reached for {signal.Symbol}."
+                : $"Paper trade skipped: OPEN position already exists for {signal.Symbol}.";
             logger.LogInformation(reason);
             return new PositionActionResult { SkippedReason = reason };
         }
@@ -111,6 +113,7 @@ public sealed class PositionManagerService(
             EntryPrice = currentPrice.Value,
             Quantity = settings.DefaultPositionQuantity,
             EntryTimeUtc = DateTime.UtcNow,
+            EntryMarketSession = signal.MarketSession,
             MaxRiskPercent = CalculateMaxRiskPercent(currentPrice.Value, analysisResponse.Analysis?.SuggestedStopLoss)
         };
 

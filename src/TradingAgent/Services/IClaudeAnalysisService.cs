@@ -8,6 +8,7 @@ public interface IClaudeAnalysisService
     Task<ClaudeAnalysisResponse> AnalyzeAsync(
         TradingViewWebhookRequest signal,
         MarketContext? marketContext,
+        MarketStatusDto marketStatus,
         CancellationToken cancellationToken);
 
     Task<ClaudeTestResult> TestAsync(CancellationToken cancellationToken);

@@ -22,7 +22,7 @@ public sealed class ClaudeAnalysisService(
         "You are a strict professional trading signal filter. Evaluate TradingView alerts against live market data and decide whether the trader should act. " +
         "Be conservative: prefer WAIT or IGNORE when setup quality is weak, indicators conflict, volume is poor, or risk/reward is unfavorable. " +
         "Only recommend BUY or SELL when multiple factors align with high conviction. " +
-        "Set shouldNotify=true only for actionable setups with confidence >= 70. " +
+        "Set shouldNotify=true only for actionable setups that meet the session confidence threshold. " +
         "Respond ONLY with valid JSON matching the required schema.";
 
     private const string FilterJsonSchema =
@@ -48,6 +48,7 @@ public sealed class ClaudeAnalysisService(
     public async Task<ClaudeAnalysisResponse> AnalyzeAsync(
         TradingViewWebhookRequest signal,
         MarketContext? marketContext,
+        MarketStatusDto marketStatus,
         CancellationToken cancellationToken)
     {
         if (!settings.ClaudeEnabled)
@@ -62,10 +63,15 @@ public sealed class ClaudeAnalysisService(
             return Fallback("Claude API key is not configured.");
         }
 
+        var session = marketStatus.MarketSession;
+        var threshold = marketStatus.SessionConfidenceThreshold;
         var prompt =
             $"You are filtering a TradingView alert. Return ONLY valid JSON with this schema:\n{FilterJsonSchema}\n" +
+            $"Market session: {session}\n" +
+            $"Session confidence threshold: {threshold}\n" +
             $"TradingView signal: {JsonSerializer.Serialize(signal, SerializerOptions)}\n" +
-            $"Live market context: {JsonSerializer.Serialize(marketContext, SerializerOptions)}";
+            $"Live market context: {JsonSerializer.Serialize(marketContext, SerializerOptions)}\n" +
+            GetSessionGuidance(session);
         var result = await SendRequestAsync(prompt, cancellationToken, FilterSystemPrompt);
 
         if (!result.IsSuccess)
@@ -214,6 +220,20 @@ public sealed class ClaudeAnalysisService(
                 Error = "Claude analysis failed unexpectedly."
             };
         }
+    }
+
+    private static string GetSessionGuidance(string marketSession)
+    {
+        if (marketSession == MarketSessionValues.Regular)
+        {
+            return "Regular session: apply standard conviction rules.";
+        }
+
+        return
+            "Extended-hours guidance: be stricter outside regular hours. " +
+            "Pre-market, after-hours, and overnight sessions have lower liquidity and higher risk. " +
+            "Only recommend BUY outside regular hours if confidence is very high and the setup is exceptional. " +
+            "Prefer WAIT or IGNORE when uncertain.";
     }
 
     private static ClaudeAnalysisResponse Fallback(string error)
