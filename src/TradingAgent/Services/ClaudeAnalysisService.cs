@@ -19,10 +19,13 @@ public sealed class ClaudeAnalysisService(
     private const int MaxLoggedResponseLength = 2000;
 
     private const string FilterSystemPrompt =
-        "You are a strict professional trading signal filter. Evaluate TradingView alerts against live market data and decide whether the trader should act. " +
-        "Be conservative: prefer WAIT or IGNORE when setup quality is weak, indicators conflict, volume is poor, or risk/reward is unfavorable. " +
-        "Only recommend BUY or SELL when multiple factors align with high conviction. " +
-        "Set shouldNotify=true only for actionable setups that meet the session confidence threshold. " +
+        "You are a professional trading signal filter. TradingView webhook indicators are the PRIMARY source of truth for strategy signals (EMA9, EMA20, EMA50, RSI, volume, volumeSpike). " +
+        "Yahoo Finance data is SECONDARY validation/context only: current price sanity, large price drift, market session, 52-week range, ATR/volatility, and liquidity. " +
+        "NEVER reject a signal solely because Yahoo EMA/RSI differs from TradingView EMA/RSI. Mention indicator mismatches only as warnings and modest confidence reductions. " +
+        "For BUY alerts, return decision BUY, WAIT, or IGNORE. Prefer WAIT over IGNORE when the setup is not clearly bad. " +
+        "BUY when TradingView EMA9 > EMA20, RSI >= 50, volumeSpike >= 70, price is close to Yahoo current price, and conviction meets the session threshold. " +
+        "WAIT when confirmation is weak but not clearly invalid (confidence 40-64). " +
+        "IGNORE only for clear contradictions, extreme price drift, very weak BUY inputs (RSI < 45 or volumeSpike < 50), or obvious high-risk conditions. " +
         "Respond ONLY with valid JSON matching the required schema.";
 
     private const string FilterJsonSchema =
@@ -49,6 +52,7 @@ public sealed class ClaudeAnalysisService(
         TradingViewWebhookRequest signal,
         MarketContext? marketContext,
         MarketStatusDto marketStatus,
+        SignalFilterContext filterContext,
         CancellationToken cancellationToken)
     {
         if (!settings.ClaudeEnabled)
@@ -65,13 +69,27 @@ public sealed class ClaudeAnalysisService(
 
         var session = marketStatus.MarketSession;
         var threshold = marketStatus.SessionConfidenceThreshold;
+        var yahooValidation = new
+        {
+            currentPrice = marketContext?.CurrentPrice,
+            atr = marketContext?.Atr,
+            week52High = marketContext?.Week52High,
+            week52Low = marketContext?.Week52Low,
+            currentVolume = marketContext?.CurrentVolume,
+            averageVolume20 = marketContext?.AverageVolume20,
+            priceDriftPercent = filterContext.PriceDriftPercent,
+            maxAllowedDriftPercent = filterContext.MaxAllowedDriftPercent,
+            indicatorWarnings = filterContext.IndicatorWarnings
+        };
+
         var prompt =
             $"You are filtering a TradingView alert. Return ONLY valid JSON with this schema:\n{FilterJsonSchema}\n" +
             $"Market session: {session}\n" +
             $"Session confidence threshold: {threshold}\n" +
-            $"TradingView signal: {JsonSerializer.Serialize(signal, SerializerOptions)}\n" +
-            $"Live market context: {JsonSerializer.Serialize(marketContext, SerializerOptions)}\n" +
-            GetSessionGuidance(session);
+            $"TradingView indicators (PRIMARY): {JsonSerializer.Serialize(filterContext.TradingView, SerializerOptions)}\n" +
+            $"Yahoo validation/context (SECONDARY): {JsonSerializer.Serialize(yahooValidation, SerializerOptions)}\n" +
+            $"Raw TradingView payload: {JsonSerializer.Serialize(signal, SerializerOptions)}\n" +
+            GetSessionGuidance(session, threshold);
         var result = await SendRequestAsync(prompt, cancellationToken, FilterSystemPrompt);
 
         if (!result.IsSuccess)
@@ -135,6 +153,37 @@ public sealed class ClaudeAnalysisService(
         CancellationToken cancellationToken,
         string? systemPrompt = null)
     {
+        var maxAttempts = Math.Max(settings.ClaudeMaxRetries, 0) + 1;
+        ClaudeRequestResult? lastResult = null;
+
+        for (var attempt = 1; attempt <= maxAttempts; attempt++)
+        {
+            lastResult = await SendRequestOnceAsync(userPrompt, cancellationToken, systemPrompt, attempt);
+
+            if (lastResult.IsSuccess)
+            {
+                return lastResult;
+            }
+
+            if (attempt < maxAttempts)
+            {
+                logger.LogWarning(
+                    "Claude request attempt {Attempt}/{MaxAttempts} failed: {Error}. Retrying...",
+                    attempt,
+                    maxAttempts,
+                    lastResult.Error);
+            }
+        }
+
+        return lastResult!;
+    }
+
+    private async Task<ClaudeRequestResult> SendRequestOnceAsync(
+        string userPrompt,
+        CancellationToken cancellationToken,
+        string? systemPrompt,
+        int attempt)
+    {
         var stopwatch = Stopwatch.StartNew();
 
         try
@@ -158,22 +207,23 @@ public sealed class ClaudeAnalysisService(
 
             var requestBody = JsonSerializer.Serialize(promptPayload, SerializerOptions);
             logger.LogInformation(
-                "Claude request started. Model={Model}, Endpoint={Endpoint}, PromptLength={PromptLength}",
+                "Claude request started. Attempt={Attempt}, Model={Model}, Endpoint={Endpoint}, PromptLength={PromptLength}",
+                attempt,
                 settings.ClaudeModel,
                 MessagesEndpoint,
                 userPrompt.Length);
 
             request.Content = new StringContent(requestBody, Encoding.UTF8, "application/json");
 
-            using var response = await client.SendAsync(request, cancellationToken);
-            var responseContent = await response.Content.ReadAsStringAsync(cancellationToken);
+            using var response = await client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken);
+            var responseContent = await response.Content.ReadAsStringAsync(CancellationToken.None);
             stopwatch.Stop();
 
             logger.LogInformation(
-                "Claude response received. StatusCode={StatusCode}, ElapsedMs={ElapsedMs}, Body={Body}",
+                "Claude response received. Attempt={Attempt}, StatusCode={StatusCode}, ElapsedMs={ElapsedMs}",
+                attempt,
                 (int)response.StatusCode,
-                stopwatch.ElapsedMilliseconds,
-                TrimForLog(responseContent));
+                stopwatch.ElapsedMilliseconds);
 
             if (!response.IsSuccessStatusCode)
             {
@@ -210,10 +260,20 @@ public sealed class ClaudeAnalysisService(
                 ElapsedMilliseconds = stopwatch.Elapsed.TotalMilliseconds
             };
         }
+        catch (OperationCanceledException exception)
+        {
+            stopwatch.Stop();
+            logger.LogWarning(exception, "Claude analysis timed out or was canceled. Attempt={Attempt}", attempt);
+            return new ClaudeRequestResult
+            {
+                ElapsedMilliseconds = stopwatch.Elapsed.TotalMilliseconds,
+                Error = "Claude analysis timeout/failure"
+            };
+        }
         catch (Exception exception)
         {
             stopwatch.Stop();
-            logger.LogError(exception, "Claude analysis failed unexpectedly.");
+            logger.LogError(exception, "Claude analysis failed unexpectedly. Attempt={Attempt}", attempt);
             return new ClaudeRequestResult
             {
                 ElapsedMilliseconds = stopwatch.Elapsed.TotalMilliseconds,
@@ -222,18 +282,16 @@ public sealed class ClaudeAnalysisService(
         }
     }
 
-    private static string GetSessionGuidance(string marketSession)
+    private static string GetSessionGuidance(string marketSession, int threshold)
     {
         if (marketSession == MarketSessionValues.Regular)
         {
-            return "Regular session: apply standard conviction rules.";
+            return $"Regular session: use TradingView indicators as primary. Threshold for BUY notify is {threshold}.";
         }
 
         return
-            "Extended-hours guidance: be stricter outside regular hours. " +
-            "Pre-market, after-hours, and overnight sessions have lower liquidity and higher risk. " +
-            "Only recommend BUY outside regular hours if confidence is very high and the setup is exceptional. " +
-            "Prefer WAIT or IGNORE when uncertain.";
+            $"Extended-hours session ({marketSession}): Yahoo is context only. Threshold for BUY notify is {threshold}. " +
+            "Be mindful of liquidity/session risk, but do not auto-reject because Yahoo EMA/RSI differs from TradingView.";
     }
 
     private static ClaudeAnalysisResponse Fallback(string error)

@@ -33,6 +33,12 @@ builder.Services.AddSingleton(sp =>
         ClaudeApiKey = ResolveClaudeApiKey(configuration),
         ClaudeModel = configuration["CLAUDE_MODEL"] ?? "claude-haiku-4-5-20251001",
         ClaudeEnabled = bool.TryParse(configuration["CLAUDE_ENABLED"], out var enabled) ? enabled : true,
+        ClaudeTimeoutSeconds = int.TryParse(configuration["CLAUDE_TIMEOUT_SECONDS"], out var claudeTimeout)
+            ? Math.Clamp(claudeTimeout, 10, 300)
+            : 60,
+        ClaudeMaxRetries = int.TryParse(configuration["CLAUDE_MAX_RETRIES"], out var claudeRetries)
+            ? Math.Clamp(claudeRetries, 0, 5)
+            : 1,
         DatabasePath = configuration["DATABASE_PATH"] ?? "/app/data/tradingagent.db",
         RetentionDays = int.TryParse(configuration["RETENTION_DAYS"], out var retentionDays) ? Math.Max(retentionDays, 1) : 30,
         WebhookSecret = configuration["WEBHOOK_SECRET"] ?? string.Empty,
@@ -40,6 +46,7 @@ builder.Services.AddSingleton(sp =>
             ? Math.Clamp(minConfidence, 0, 100)
             : 70,
         SendIgnoredSignals = bool.TryParse(configuration["SEND_IGNORED_SIGNALS"], out var sendIgnored) && sendIgnored,
+        SendWaitSignals = bool.TryParse(configuration["SEND_WAIT_SIGNALS"], out var sendWait) && sendWait,
         PaperTradingEnabled = !bool.TryParse(configuration["PAPER_TRADING_ENABLED"], out var paperTrading) || paperTrading,
         DefaultPositionQuantity = decimal.TryParse(configuration["DEFAULT_POSITION_QUANTITY"], out var quantity) && quantity > 0
             ? quantity
@@ -56,16 +63,22 @@ builder.Services.AddSingleton(sp =>
         Enable24_5Trading = !bool.TryParse(configuration["ENABLE_24_5_TRADING"], out var enable24_5) || enable24_5,
         MinConfidenceRegular = int.TryParse(configuration["MIN_CONFIDENCE_REGULAR"], out var minConfRegular)
             ? Math.Clamp(minConfRegular, 0, 100)
-            : 70,
+            : 65,
         MinConfidencePremarket = int.TryParse(configuration["MIN_CONFIDENCE_PREMARKET"], out var minConfPremarket)
             ? Math.Clamp(minConfPremarket, 0, 100)
-            : 85,
+            : 75,
         MinConfidenceAfterHours = int.TryParse(configuration["MIN_CONFIDENCE_AFTER_HOURS"], out var minConfAfterHours)
             ? Math.Clamp(minConfAfterHours, 0, 100)
-            : 85,
+            : 75,
         MinConfidenceOvernight = int.TryParse(configuration["MIN_CONFIDENCE_OVERNIGHT"], out var minConfOvernight)
             ? Math.Clamp(minConfOvernight, 0, 100)
-            : 90,
+            : 85,
+        MaxPriceDriftPercentRegular = decimal.TryParse(configuration["MAX_PRICE_DRIFT_PERCENT_REGULAR"], out var driftRegular)
+            ? Math.Clamp(driftRegular, 0.1m, 10m)
+            : 1.0m,
+        MaxPriceDriftPercentExtended = decimal.TryParse(configuration["MAX_PRICE_DRIFT_PERCENT_EXTENDED"], out var driftExtended)
+            ? Math.Clamp(driftExtended, 0.1m, 15m)
+            : 2.5m,
         AllowScaleIn = bool.TryParse(configuration["ALLOW_SCALE_IN"], out var allowScaleIn) && allowScaleIn,
         MaxPositionsPerSymbol = int.TryParse(configuration["MAX_POSITIONS_PER_SYMBOL"], out var maxPositions) && maxPositions > 0
             ? maxPositions
@@ -92,10 +105,11 @@ builder.Services.AddHttpClient(TelegramNotificationService.HttpClientName, clien
     client.Timeout = TimeSpan.FromSeconds(15);
 });
 
-builder.Services.AddHttpClient(ClaudeAnalysisService.HttpClientName, client =>
+builder.Services.AddHttpClient(ClaudeAnalysisService.HttpClientName, (serviceProvider, client) =>
 {
+    var appSettings = serviceProvider.GetRequiredService<AppSettings>();
     client.BaseAddress = new Uri("https://api.anthropic.com/");
-    client.Timeout = TimeSpan.FromSeconds(30);
+    client.Timeout = TimeSpan.FromSeconds(Math.Max(appSettings.ClaudeTimeoutSeconds, 10));
 });
 
 builder.Services.AddHttpClient(YahooFinanceService.HttpClientName, client =>
@@ -109,6 +123,7 @@ builder.Services.AddScoped<ITelegramNotificationService, TelegramNotificationSer
 builder.Services.AddScoped<IYahooFinanceService, YahooFinanceService>();
 builder.Services.AddScoped<IPositionManagerService, PositionManagerService>();
 builder.Services.AddScoped<IWebhookProcessorService, WebhookProcessorService>();
+builder.Services.AddSingleton<IRuntimeSettingsService, RuntimeSettingsService>();
 builder.Services.AddSingleton<IMarketCalendarService, MarketCalendarService>();
 builder.Services.AddSingleton<IMarketProvider, NasdaqMarketProvider>();
 builder.Services.AddSingleton<IMarketProvider, NyseMarketProvider>();
@@ -135,6 +150,7 @@ app.UseDefaultFiles();
 app.UseStaticFiles();
 
 await EnsureDatabaseAsync(app);
+await ApplyRuntimeSettingsAsync(app);
 ValidateRequiredConfiguration(app.Services);
 
 var api = app.MapGroup("/api");
@@ -165,6 +181,9 @@ api.MapGet("/test-yahoo", TestYahooAsync)
 
 api.MapGet("/settings", GetSettingsAsync)
     .WithName("GetSettings");
+
+api.MapPatch("/settings", PatchSettingsAsync)
+    .WithName("PatchSettings");
 
 api.MapGet("/positions/open", GetOpenPositionsAsync)
     .WithName("GetOpenPositions");
@@ -221,6 +240,52 @@ static async Task EnsureDatabaseAsync(WebApplication app)
     await EnsureWebhookRequestLogsTableAsync(dbContext);
     await EnsureTradingSignalAuditColumnsAsync(dbContext);
     await EnsureTradingSignalMarketColumnsAsync(dbContext);
+    await EnsureTradingSignalReasonCategoryColumnAsync(dbContext);
+    await EnsureRuntimeSettingsTableAsync(dbContext);
+}
+
+static async Task EnsureTradingSignalReasonCategoryColumnAsync(TradingAgentDbContext dbContext)
+{
+    var connection = dbContext.Database.GetDbConnection();
+    if (connection.State != System.Data.ConnectionState.Open)
+    {
+        await connection.OpenAsync();
+    }
+
+    var existingColumns = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+    await using (var command = connection.CreateCommand())
+    {
+        command.CommandText = "PRAGMA table_info(TradingSignals);";
+        await using var reader = await command.ExecuteReaderAsync();
+        while (await reader.ReadAsync())
+        {
+            existingColumns.Add(reader.GetString(1));
+        }
+    }
+
+    if (!existingColumns.Contains("ReasonCategories"))
+    {
+        await dbContext.Database.ExecuteSqlRawAsync(
+            "ALTER TABLE TradingSignals ADD COLUMN ReasonCategories TEXT NULL;");
+    }
+}
+
+static async Task ApplyRuntimeSettingsAsync(WebApplication app)
+{
+    using var scope = app.Services.CreateScope();
+    var runtimeSettings = scope.ServiceProvider.GetRequiredService<IRuntimeSettingsService>();
+    await runtimeSettings.ApplyDatabaseOverridesAsync();
+}
+
+static async Task EnsureRuntimeSettingsTableAsync(TradingAgentDbContext dbContext)
+{
+    await dbContext.Database.ExecuteSqlRawAsync("""
+        CREATE TABLE IF NOT EXISTS RuntimeSettings (
+            Key TEXT NOT NULL CONSTRAINT PK_RuntimeSettings PRIMARY KEY,
+            Value TEXT NOT NULL,
+            UpdatedAtUtc TEXT NOT NULL
+        );
+        """);
 }
 
 static async Task EnsureSignalMarketDataTableAsync(TradingAgentDbContext dbContext)
@@ -471,12 +536,11 @@ static string ResolveClaudeApiKey(IConfiguration configuration)
 
 static async Task<IResult> HandleTradingViewWebhookAsync(
     HttpRequest request,
-    IWebhookProcessorService webhookProcessorService,
-    CancellationToken cancellationToken)
+    IWebhookProcessorService webhookProcessorService)
 {
     using var reader = new StreamReader(request.Body);
-    var rawPayload = await reader.ReadToEndAsync(cancellationToken);
-    var result = await webhookProcessorService.ProcessAsync(request, rawPayload, forceTest: false, cancellationToken);
+    var rawPayload = await reader.ReadToEndAsync(CancellationToken.None);
+    var result = await webhookProcessorService.ProcessAsync(request, rawPayload, forceTest: false);
     return ToWebhookResult(result);
 }
 
@@ -484,8 +548,7 @@ static async Task<IResult> HandleTestWebhookAsync(
     HttpRequest request,
     TestWebhookRequest testRequest,
     AppSettings settings,
-    IWebhookProcessorService webhookProcessorService,
-    CancellationToken cancellationToken)
+    IWebhookProcessorService webhookProcessorService)
 {
     if (string.IsNullOrWhiteSpace(testRequest.Symbol) || string.IsNullOrWhiteSpace(testRequest.Signal))
     {
@@ -508,21 +571,28 @@ static async Task<IResult> HandleTestWebhookAsync(
         secret = settings.WebhookSecret
     });
 
-    var result = await webhookProcessorService.ProcessAsync(request, payload, forceTest: true, cancellationToken);
+    var result = await webhookProcessorService.ProcessAsync(request, payload, forceTest: true);
     return ToWebhookResult(result);
 }
 
 static IResult ToWebhookResult(WebhookProcessResponse result)
     => result.ResultStatus switch
     {
-        "UNAUTHORIZED" => TypedResults.Json(result, statusCode: StatusCodes.Status401Unauthorized),
-        "BAD_REQUEST" => TypedResults.Json(result, statusCode: StatusCodes.Status400BadRequest),
-        "ERROR" => TypedResults.Json(result, statusCode: StatusCodes.Status500InternalServerError),
+        WebhookResultStatuses.Unauthorized => TypedResults.Json(result, statusCode: StatusCodes.Status401Unauthorized),
+        WebhookResultStatuses.BadRequest => TypedResults.Json(result, statusCode: StatusCodes.Status400BadRequest),
+        WebhookResultStatuses.Error => TypedResults.Json(result, statusCode: StatusCodes.Status500InternalServerError),
         _ => TypedResults.Json(result, statusCode: StatusCodes.Status200OK)
     };
 
-static async Task<Ok<List<object>>> GetWebhookHistoryAsync(
+static async Task<IResult> GetWebhookHistoryAsync(
     string? filter,
+    string? source,
+    string? status,
+    string? symbol,
+    string? from,
+    string? to,
+    int? page,
+    int? pageSize,
     TradingAgentDbContext dbContext,
     CancellationToken cancellationToken)
 {
@@ -537,10 +607,62 @@ static async Task<Ok<List<object>>> GetWebhookHistoryAsync(
         query = query.Where(log => log.IsTest);
     }
 
-    var logs = await query
-        .OrderByDescending(log => log.ReceivedAtUtc)
-        .Take(200)
-        .ToListAsync(cancellationToken);
+    if (!string.IsNullOrWhiteSpace(source))
+    {
+        var normalizedSource = source.Trim().ToUpperInvariant();
+        query = query.Where(log => log.Source.ToUpper() == normalizedSource);
+    }
+
+    if (!string.IsNullOrWhiteSpace(status))
+    {
+        var normalizedStatus = status.Trim().ToUpperInvariant();
+        query = query.Where(log => log.ResultStatus.ToUpper() == normalizedStatus);
+    }
+
+    var fromUtc = PaginationHelper.ParseUtcDate(from);
+    if (fromUtc.HasValue)
+    {
+        query = query.Where(log => log.ReceivedAtUtc >= fromUtc.Value);
+    }
+
+    var toUtc = PaginationHelper.ParseUtcDate(to);
+    if (toUtc.HasValue)
+    {
+        query = query.Where(log => log.ReceivedAtUtc <= toUtc.Value);
+    }
+
+    if (!string.IsNullOrWhiteSpace(symbol))
+    {
+        var normalizedSymbol = symbol.Trim().ToUpperInvariant();
+        var matchingSignalIds = dbContext.TradingSignals
+            .AsNoTracking()
+            .Where(signal => signal.Symbol == normalizedSymbol)
+            .Select(signal => signal.Id);
+
+        query = query.Where(log =>
+            log.TradingSignalId.HasValue && matchingSignalIds.Contains(log.TradingSignalId.Value));
+    }
+
+    query = query.OrderByDescending(log => log.ReceivedAtUtc);
+
+    List<WebhookRequestLog> logs;
+    int total = 0;
+    int resolvedPage = 1;
+    int resolvedPageSize = 25;
+
+    if (PaginationHelper.WantsPagination(page, pageSize))
+    {
+        (resolvedPage, resolvedPageSize) = PaginationHelper.Resolve(page, pageSize);
+        total = await query.CountAsync(cancellationToken);
+        logs = await query
+            .Skip((resolvedPage - 1) * resolvedPageSize)
+            .Take(resolvedPageSize)
+            .ToListAsync(cancellationToken);
+    }
+    else
+    {
+        logs = await query.Take(200).ToListAsync(cancellationToken);
+    }
 
     var signalIds = logs
         .Where(log => log.TradingSignalId.HasValue)
@@ -571,6 +693,11 @@ static async Task<Ok<List<object>>> GetWebhookHistoryAsync(
         };
     }).ToList();
 
+    if (PaginationHelper.WantsPagination(page, pageSize))
+    {
+        return TypedResults.Ok(PaginationHelper.Create(response, resolvedPage, resolvedPageSize, total));
+    }
+
     return TypedResults.Ok(response);
 }
 
@@ -591,8 +718,17 @@ static async Task<Ok<object>> DeleteWebhookHistoryAsync(
     return TypedResults.Ok((object)new { deleted });
 }
 
-static async Task<Ok<List<TradingSignal>>> GetSignalsAsync(
+static async Task<IResult> GetSignalsAsync(
     string? symbol,
+    string? signal,
+    string? decision,
+    string? session,
+    bool? notified,
+    string? from,
+    string? to,
+    bool? isTest,
+    int? page,
+    int? pageSize,
     TradingAgentDbContext dbContext,
     CancellationToken cancellationToken)
 {
@@ -601,15 +737,71 @@ static async Task<Ok<List<TradingSignal>>> GetSignalsAsync(
     if (!string.IsNullOrWhiteSpace(symbol))
     {
         var normalizedSymbol = symbol.Trim().ToUpperInvariant();
-        query = query.Where(signal => signal.Symbol == normalizedSymbol);
+        query = query.Where(item => item.Symbol == normalizedSymbol);
     }
 
-    var signals = await query
-        .Include(signal => signal.MarketData)
-        .OrderByDescending(signal => signal.CreatedAtUtc)
+    if (!string.IsNullOrWhiteSpace(signal))
+    {
+        var normalizedSignal = signal.Trim().ToUpperInvariant();
+        query = query.Where(item => item.OriginalSignal == normalizedSignal);
+    }
+
+    if (!string.IsNullOrWhiteSpace(decision))
+    {
+        var normalizedDecision = decision.Trim().ToUpperInvariant();
+        query = query.Where(item => item.ClaudeAction != null && item.ClaudeAction.ToUpper() == normalizedDecision);
+    }
+
+    if (!string.IsNullOrWhiteSpace(session))
+    {
+        var normalizedSession = session.Trim().ToUpperInvariant();
+        query = query.Where(item =>
+            (item.MarketSession != null && item.MarketSession.ToUpper() == normalizedSession)
+            || (item.MarketStatus != null && item.MarketStatus.ToUpper() == normalizedSession));
+    }
+
+    if (notified.HasValue)
+    {
+        query = query.Where(item => item.Notified == notified.Value);
+    }
+
+    if (isTest.HasValue)
+    {
+        query = query.Where(item => item.IsTest == isTest.Value);
+    }
+
+    var fromUtc = PaginationHelper.ParseUtcDate(from);
+    if (fromUtc.HasValue)
+    {
+        query = query.Where(item => item.CreatedAtUtc >= fromUtc.Value);
+    }
+
+    var toUtc = PaginationHelper.ParseUtcDate(to);
+    if (toUtc.HasValue)
+    {
+        query = query.Where(item => item.CreatedAtUtc <= toUtc.Value);
+    }
+
+    query = query.OrderByDescending(item => item.CreatedAtUtc);
+
+    if (!PaginationHelper.WantsPagination(page, pageSize))
+    {
+        var signals = await query
+            .Include(item => item.MarketData)
+            .ToListAsync(cancellationToken);
+
+        return TypedResults.Ok(signals);
+    }
+
+    var (resolvedPage, resolvedPageSize) = PaginationHelper.Resolve(page, pageSize);
+    var total = await query.CountAsync(cancellationToken);
+    var items = await query
+        .Include(item => item.MarketData)
+        .Skip((resolvedPage - 1) * resolvedPageSize)
+        .Take(resolvedPageSize)
         .ToListAsync(cancellationToken);
 
-    return TypedResults.Ok(signals);
+    return TypedResults.Ok(PaginationHelper.Create(items, resolvedPage, resolvedPageSize, total));
 }
 
 static async Task<Results<Ok<TradingSignal>, NotFound>> GetSignalByIdAsync(
@@ -727,33 +919,54 @@ static async Task<IResult> TestYahooAsync(
     return TypedResults.Ok(marketContext);
 }
 
-static IResult GetSettingsAsync(AppSettings settings)
-    => TypedResults.Ok(new Dictionary<string, object?>
+static IResult GetSettingsAsync(IRuntimeSettingsService runtimeSettings)
+{
+    var response = runtimeSettings.GetSettings();
+    return TypedResults.Ok(new
     {
-        ["MIN_CONFIDENCE_TO_NOTIFY"] = settings.MinConfidenceToNotify,
-        ["SEND_IGNORED_SIGNALS"] = settings.SendIgnoredSignals,
-        ["CLAUDE_ENABLED"] = settings.ClaudeEnabled,
-        ["CLAUDE_MODEL"] = settings.ClaudeModel,
-        ["PAPER_TRADING_ENABLED"] = settings.PaperTradingEnabled,
-        ["DEFAULT_POSITION_QUANTITY"] = settings.DefaultPositionQuantity,
-        ["ALLOW_TEST_TRADES"] = settings.AllowTestTrades,
-        ["SEND_TEST_TELEGRAM"] = settings.SendTestTelegram,
-        ["MARKET_PROVIDER"] = settings.MarketProvider,
-        ["MARKET_TIMEZONE"] = settings.MarketTimezone,
-        ["ALLOW_PREMARKET"] = settings.AllowPreMarket,
-        ["ALLOW_AFTER_HOURS"] = settings.AllowAfterHours,
-        ["ALLOW_OVERNIGHT"] = settings.AllowOvernight,
-        ["IGNORE_SIGNALS_WHEN_MARKET_CLOSED"] = settings.IgnoreSignalsWhenMarketClosed,
-        ["SEND_MARKET_CLOSED_NOTIFICATIONS"] = settings.SendMarketClosedNotifications,
-        ["ENABLE_24_5_TRADING"] = settings.Enable24_5Trading,
-        ["MIN_CONFIDENCE_REGULAR"] = settings.MinConfidenceRegular,
-        ["MIN_CONFIDENCE_PREMARKET"] = settings.MinConfidencePremarket,
-        ["MIN_CONFIDENCE_AFTER_HOURS"] = settings.MinConfidenceAfterHours,
-        ["MIN_CONFIDENCE_OVERNIGHT"] = settings.MinConfidenceOvernight,
-        ["ALLOW_SCALE_IN"] = settings.AllowScaleIn,
-        ["MAX_POSITIONS_PER_SYMBOL"] = settings.MaxPositionsPerSymbol,
-        ["SEND_DUPLICATE_BUY_NOTIFICATIONS"] = settings.SendDuplicateBuyNotifications
+        settings = response.Values,
+        overriddenKeys = response.OverriddenKeys,
+        editableKeys = response.EditableKeys
     });
+}
+
+static async Task<IResult> PatchSettingsAsync(
+    UpdateSettingsRequest request,
+    IRuntimeSettingsService runtimeSettings,
+    CancellationToken cancellationToken)
+{
+    if (request.Settings is null || request.Settings.Count == 0)
+    {
+        return TypedResults.BadRequest(new { error = "At least one setting must be provided." });
+    }
+
+    var updates = request.Settings.ToDictionary(
+        pair => pair.Key,
+        pair => pair.Value.ValueKind switch
+        {
+            System.Text.Json.JsonValueKind.String => pair.Value.GetString() ?? string.Empty,
+            System.Text.Json.JsonValueKind.True => "true",
+            System.Text.Json.JsonValueKind.False => "false",
+            System.Text.Json.JsonValueKind.Number => pair.Value.GetRawText(),
+            _ => pair.Value.GetRawText()
+        },
+        StringComparer.OrdinalIgnoreCase);
+
+    try
+    {
+        var response = await runtimeSettings.UpdateSettingsAsync(updates, cancellationToken);
+        return TypedResults.Ok(new
+        {
+            settings = response.Values,
+            overriddenKeys = response.OverriddenKeys,
+            editableKeys = response.EditableKeys
+        });
+    }
+    catch (ArgumentException exception)
+    {
+        return TypedResults.BadRequest(new { error = exception.Message });
+    }
+}
 
 static IResult GetMarketStatusAsync(IMarketStatusService marketStatusService)
     => TypedResults.Ok(marketStatusService.GetStatus());
@@ -782,16 +995,116 @@ static IResult TestMarketAsync(
     return TypedResults.Ok(status);
 }
 
-static async Task<Ok<List<Position>>> GetPositionsAsync(
+static async Task<IResult> GetPositionsAsync(
+    string? symbol,
+    string? status,
+    string? outcome,
+    string? from,
+    string? to,
+    int? page,
+    int? pageSize,
     TradingAgentDbContext dbContext,
     CancellationToken cancellationToken)
 {
-    var positions = await dbContext.Positions
-        .AsNoTracking()
-        .OrderByDescending(position => position.EntryTimeUtc)
+    var query = dbContext.Positions.AsNoTracking();
+
+    if (!string.IsNullOrWhiteSpace(symbol))
+    {
+        var normalizedSymbol = symbol.Trim().ToUpperInvariant();
+        query = query.Where(position => position.Symbol == normalizedSymbol);
+    }
+
+    if (!string.IsNullOrWhiteSpace(status))
+    {
+        var normalizedStatus = status.Trim().ToUpperInvariant();
+        if (normalizedStatus is "OPEN" or "CLOSED")
+        {
+            query = query.Where(position => position.Status == normalizedStatus);
+        }
+    }
+
+    if (string.Equals(outcome, "win", StringComparison.OrdinalIgnoreCase))
+    {
+        query = query.Where(position => position.ProfitLoss.HasValue && position.ProfitLoss > 0);
+    }
+    else if (string.Equals(outcome, "loss", StringComparison.OrdinalIgnoreCase))
+    {
+        query = query.Where(position => position.ProfitLoss.HasValue && position.ProfitLoss < 0);
+    }
+
+    var fromUtc = PaginationHelper.ParseUtcDate(from);
+    if (fromUtc.HasValue)
+    {
+        query = query.Where(position =>
+            position.EntryTimeUtc >= fromUtc.Value
+            || (position.ExitTimeUtc.HasValue && position.ExitTimeUtc.Value >= fromUtc.Value));
+    }
+
+    var toUtc = PaginationHelper.ParseUtcDate(to);
+    if (toUtc.HasValue)
+    {
+        query = query.Where(position => position.EntryTimeUtc <= toUtc.Value);
+    }
+
+    query = query.OrderByDescending(position => position.ExitTimeUtc ?? position.EntryTimeUtc);
+
+    if (!PaginationHelper.WantsPagination(page, pageSize))
+    {
+        var positions = await query.ToListAsync(cancellationToken);
+        return TypedResults.Ok(positions);
+    }
+
+    var (resolvedPage, resolvedPageSize) = PaginationHelper.Resolve(page, pageSize);
+    var total = await query.CountAsync(cancellationToken);
+    var pageItems = await query
+        .Skip((resolvedPage - 1) * resolvedPageSize)
+        .Take(resolvedPageSize)
         .ToListAsync(cancellationToken);
 
-    return TypedResults.Ok(positions);
+    var items = await ToPositionListItemsAsync(pageItems, dbContext, cancellationToken);
+    return TypedResults.Ok(PaginationHelper.Create(items, resolvedPage, resolvedPageSize, total));
+}
+
+static async Task<List<PositionListItem>> ToPositionListItemsAsync(
+    List<Position> positions,
+    TradingAgentDbContext dbContext,
+    CancellationToken cancellationToken)
+{
+    if (positions.Count == 0)
+    {
+        return [];
+    }
+
+    var signalIds = positions.Select(position => position.EntrySignalId).Distinct().ToList();
+    var signals = await dbContext.TradingSignals
+        .AsNoTracking()
+        .Where(signal => signalIds.Contains(signal.Id))
+        .ToDictionaryAsync(signal => signal.Id, cancellationToken);
+
+    return positions.Select(position =>
+    {
+        signals.TryGetValue(position.EntrySignalId, out var signal);
+        return new PositionListItem
+        {
+            Id = position.Id,
+            Symbol = position.Symbol,
+            Status = position.Status,
+            EntrySignalId = position.EntrySignalId,
+            ExitSignalId = position.ExitSignalId,
+            EntryPrice = position.EntryPrice,
+            ExitPrice = position.ExitPrice,
+            Quantity = position.Quantity,
+            EntryTimeUtc = position.EntryTimeUtc,
+            ExitTimeUtc = position.ExitTimeUtc,
+            ProfitLoss = position.ProfitLoss,
+            ProfitLossPercent = position.ProfitLossPercent,
+            MaxRiskPercent = position.MaxRiskPercent,
+            EntryMarketSession = position.EntryMarketSession,
+            Notes = position.Notes,
+            StopLoss = signal?.SuggestedStopLoss,
+            TakeProfit = signal?.SuggestedTakeProfit
+        };
+    }).ToList();
 }
 
 static async Task<Ok<List<Position>>> GetOpenPositionsAsync(

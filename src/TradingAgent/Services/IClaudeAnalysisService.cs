@@ -9,6 +9,7 @@ public interface IClaudeAnalysisService
         TradingViewWebhookRequest signal,
         MarketContext? marketContext,
         MarketStatusDto marketStatus,
+        SignalFilterContext filterContext,
         CancellationToken cancellationToken);
 
     Task<ClaudeTestResult> TestAsync(CancellationToken cancellationToken);

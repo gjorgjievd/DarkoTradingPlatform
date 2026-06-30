@@ -28,6 +28,7 @@ public sealed class TradingSignal
     public bool IsClosed { get; set; }
     public string? IgnoredReason { get; set; }
     public string? IgnoredBy { get; set; }
+    public string? ReasonCategories { get; set; }
     public string? MarketStatus { get; set; }
     public string? MarketSession { get; set; }
     public string? MarketName { get; set; }

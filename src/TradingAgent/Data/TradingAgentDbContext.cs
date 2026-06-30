@@ -9,6 +9,7 @@ public sealed class TradingAgentDbContext(DbContextOptions<TradingAgentDbContext
     public DbSet<SignalMarketData> SignalMarketData => Set<SignalMarketData>();
     public DbSet<Position> Positions => Set<Position>();
     public DbSet<WebhookRequestLog> WebhookRequestLogs => Set<WebhookRequestLog>();
+    public DbSet<RuntimeSetting> RuntimeSettings => Set<RuntimeSetting>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -22,6 +23,7 @@ public sealed class TradingAgentDbContext(DbContextOptions<TradingAgentDbContext
         entity.Property(signal => signal.Timeframe).HasMaxLength(16);
         entity.Property(signal => signal.Strategy).HasMaxLength(64);
         entity.Property(signal => signal.ShortReason).HasMaxLength(1024);
+        entity.Property(signal => signal.ReasonCategories).HasMaxLength(256);
         entity.Property(signal => signal.Notes).HasMaxLength(4000);
         entity.Property(signal => signal.Source).HasMaxLength(32);
         entity.Property(signal => signal.RawPayload).IsRequired();
@@ -79,5 +81,10 @@ public sealed class TradingAgentDbContext(DbContextOptions<TradingAgentDbContext
         webhookLog.HasIndex(item => item.ReceivedAtUtc);
         webhookLog.HasIndex(item => item.IsTest);
         webhookLog.HasIndex(item => item.TradingSignalId);
+
+        var runtimeSetting = modelBuilder.Entity<RuntimeSetting>();
+        runtimeSetting.HasKey(item => item.Key);
+        runtimeSetting.Property(item => item.Key).HasMaxLength(64).IsRequired();
+        runtimeSetting.Property(item => item.Value).HasMaxLength(512).IsRequired();
     }
 }

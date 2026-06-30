@@ -14,8 +14,7 @@ public interface IWebhookProcessorService
     Task<WebhookProcessResponse> ProcessAsync(
         HttpRequest request,
         string rawPayload,
-        bool forceTest,
-        CancellationToken cancellationToken);
+        bool forceTest);
 }
 
 public sealed class WebhookProcessorService(
@@ -28,11 +27,12 @@ public sealed class WebhookProcessorService(
     AppSettings settings,
     ILogger<WebhookProcessorService> logger) : IWebhookProcessorService
 {
+    private static readonly CancellationToken DbCancellation = CancellationToken.None;
+
     public async Task<WebhookProcessResponse> ProcessAsync(
         HttpRequest request,
         string rawPayload,
-        bool forceTest,
-        CancellationToken cancellationToken)
+        bool forceTest)
     {
         var webhookLog = new WebhookRequestLog
         {
@@ -44,13 +44,19 @@ public sealed class WebhookProcessorService(
         };
 
         dbContext.WebhookRequestLogs.Add(webhookLog);
-        await dbContext.SaveChangesAsync(cancellationToken);
+        await SaveChangesAsync();
+
+        logger.LogInformation("Webhook received. WebhookLogId={WebhookLogId}", webhookLog.Id);
+
+        using var processingCts = new CancellationTokenSource(
+            TimeSpan.FromSeconds(Math.Max(settings.ClaudeTimeoutSeconds + 30, 60)));
+        var workToken = processingCts.Token;
 
         try
         {
             if (string.IsNullOrWhiteSpace(rawPayload))
             {
-                return await FailAsync(webhookLog, "BAD_REQUEST", "Request body is required.", cancellationToken);
+                return await FailAsync(webhookLog, WebhookResultStatuses.BadRequest, "Request body is required.");
             }
 
             TradingViewWebhookRequest? payload;
@@ -62,7 +68,7 @@ public sealed class WebhookProcessorService(
             }
             catch (JsonException)
             {
-                return await FailAsync(webhookLog, "BAD_REQUEST", "Invalid JSON payload.", cancellationToken);
+                return await FailAsync(webhookLog, WebhookResultStatuses.BadRequest, "Invalid JSON payload.");
             }
 
             var (source, isTest) = forceTest
@@ -71,11 +77,11 @@ public sealed class WebhookProcessorService(
 
             webhookLog.Source = source;
             webhookLog.IsTest = isTest;
-            await dbContext.SaveChangesAsync(cancellationToken);
+            await SaveChangesAsync();
 
             if (payload is null || string.IsNullOrWhiteSpace(payload.Symbol) || string.IsNullOrWhiteSpace(payload.Signal))
             {
-                return await FailAsync(webhookLog, "BAD_REQUEST", "Payload must include symbol and signal.", cancellationToken);
+                return await FailAsync(webhookLog, WebhookResultStatuses.BadRequest, "Payload must include symbol and signal.");
             }
 
             var headerSecret = request.Headers["X-Webhook-Secret"].FirstOrDefault()
@@ -85,11 +91,11 @@ public sealed class WebhookProcessorService(
             if (!string.Equals(providedSecret, settings.WebhookSecret, StringComparison.Ordinal))
             {
                 logger.LogWarning("Rejected webhook for symbol {Symbol} because of an invalid secret.", payload.Symbol);
-                return await FailAsync(webhookLog, "UNAUTHORIZED", "Invalid webhook secret.", cancellationToken);
+                return await FailAsync(webhookLog, WebhookResultStatuses.Unauthorized, "Invalid webhook secret.");
             }
 
             logger.LogInformation(
-                "Webhook received. Source={Source}, IsTest={IsTest}, Symbol={Symbol}, Signal={Signal}",
+                "Webhook validated. Source={Source}, IsTest={IsTest}, Symbol={Symbol}, Signal={Signal}",
                 source,
                 isTest,
                 payload.Symbol.Trim().ToUpperInvariant(),
@@ -109,10 +115,12 @@ public sealed class WebhookProcessorService(
             };
 
             dbContext.TradingSignals.Add(tradingSignal);
-            await dbContext.SaveChangesAsync(cancellationToken);
+            await SaveChangesAsync();
 
             webhookLog.TradingSignalId = tradingSignal.Id;
-            await dbContext.SaveChangesAsync(cancellationToken);
+            await SaveChangesAsync();
+
+            logger.LogInformation("Signal saved. SignalId={SignalId}, Symbol={Symbol}", tradingSignal.Id, tradingSignal.Symbol);
 
             var marketStatus = marketStatusService.GetStatus();
             tradingSignal.MarketName = marketStatus.MarketName;
@@ -122,126 +130,156 @@ public sealed class WebhookProcessorService(
 
             if (marketStatusService.ShouldIgnoreSignal(marketStatus))
             {
-                tradingSignal.ClaudeAction = "IGNORE";
-                tradingSignal.ShortReason = "Market closed";
-                tradingSignal.IgnoredReason = marketStatusService.GetIgnoredReason(marketStatus);
-                tradingSignal.IgnoredBy = SignalIgnoredBy.MarketStatus;
-                tradingSignal.ShouldNotify = false;
-                tradingSignal.Notified = false;
-
-                await dbContext.SaveChangesAsync(cancellationToken);
-
-                if (settings.SendMarketClosedNotifications && !isTest)
-                {
-                    await telegramNotificationService.SendMarketClosedAsync(tradingSignal, marketStatus, cancellationToken);
-                    tradingSignal.Notified = true;
-                    await dbContext.SaveChangesAsync(cancellationToken);
-                }
-
-                logger.LogInformation(
-                    "Signal {SignalId} ignored due to market status. Market={Market}, Status={Status}, Reason={Reason}",
-                    tradingSignal.Id,
-                    marketStatus.MarketName,
-                    marketStatus.Status,
-                    tradingSignal.IgnoredReason);
-
-                webhookLog.ResultStatus = "SUCCESS";
-                webhookLog.ErrorMessage = null;
-                await dbContext.SaveChangesAsync(cancellationToken);
-
-                return new WebhookProcessResponse
-                {
-                    Success = true,
-                    WebhookLogId = webhookLog.Id,
-                    SignalId = tradingSignal.Id,
-                    Source = source,
-                    IsTest = isTest,
-                    ResultStatus = webhookLog.ResultStatus,
-                    Signal = tradingSignal,
-                    MarketIgnored = true,
-                    MarketStatus = marketStatus
-                };
+                return await FinalizeMarketIgnoredAsync(webhookLog, tradingSignal, marketStatus, isTest, source);
             }
 
-            var marketContext = await yahooFinanceService.FetchMarketContextAsync(tradingSignal.Symbol, cancellationToken);
+            MarketContext marketContext;
+            try
+            {
+                logger.LogInformation("Yahoo fetch started. Symbol={Symbol}", tradingSignal.Symbol);
+                marketContext = await yahooFinanceService.FetchMarketContextAsync(tradingSignal.Symbol, workToken);
+                logger.LogInformation("Yahoo fetch completed. Symbol={Symbol}", tradingSignal.Symbol);
+            }
+            catch (Exception exception) when (exception is OperationCanceledException or TaskCanceledException)
+            {
+                logger.LogWarning(exception, "Yahoo fetch canceled or timed out. Symbol={Symbol}", tradingSignal.Symbol);
+                return await FinalizeAiFailureAsync(
+                    webhookLog,
+                    tradingSignal,
+                    source,
+                    isTest,
+                    "Yahoo Finance fetch timeout/failure");
+            }
+            catch (Exception exception)
+            {
+                logger.LogError(exception, "Yahoo fetch failed. Symbol={Symbol}", tradingSignal.Symbol);
+                return await FinalizeAiFailureAsync(
+                    webhookLog,
+                    tradingSignal,
+                    source,
+                    isTest,
+                    "Yahoo Finance fetch failed");
+            }
+
             var marketDataEntity = MarketContextMapper.ToEntity(marketContext, tradingSignal.Id);
             dbContext.SignalMarketData.Add(marketDataEntity);
-            await dbContext.SaveChangesAsync(cancellationToken);
+            await SaveChangesAsync();
             tradingSignal.MarketData = marketDataEntity;
 
-            var analysisResponse = await claudeAnalysisService.AnalyzeAsync(payload, marketContext, marketStatus, cancellationToken);
+            var filterContext = SignalFilterService.BuildContext(payload, marketContext, marketStatus, settings);
+            var hasOpenPosition = await dbContext.Positions.AnyAsync(
+                position => position.Symbol == tradingSignal.Symbol && position.Status == PositionStatus.Open,
+                DbCancellation);
 
-            tradingSignal.ClaudeAction = analysisResponse.Analysis?.Action;
-            tradingSignal.Confidence = analysisResponse.Analysis?.Confidence;
-            tradingSignal.RiskLevel = analysisResponse.Analysis?.RiskLevel;
-            tradingSignal.ClaudeRawResponse = analysisResponse.RawResponse;
-            tradingSignal.ShortReason = analysisResponse.IsFallback
-                ? analysisResponse.Error ?? "Claude unavailable, fallback mode."
-                : analysisResponse.Analysis?.ShortReason;
-            tradingSignal.SuggestedStopLoss = analysisResponse.Analysis?.SuggestedStopLoss;
-            tradingSignal.SuggestedTakeProfit = analysisResponse.Analysis?.SuggestedTakeProfit;
-            tradingSignal.RiskRewardRatio = analysisResponse.Analysis?.RiskRewardRatio;
-            tradingSignal.PositionSizePercent = analysisResponse.Analysis?.PositionSizePercent;
-            tradingSignal.ShouldNotify = analysisResponse.Analysis?.ShouldNotify;
+            var preClaudeResult = SignalFilterService.EvaluatePreClaude(filterContext, hasOpenPosition);
+            if (preClaudeResult.SkipClaude)
+            {
+                return await FinalizePreClaudeAsync(
+                    webhookLog,
+                    tradingSignal,
+                    preClaudeResult,
+                    source,
+                    isTest);
+            }
 
-            await dbContext.SaveChangesAsync(cancellationToken);
+            ClaudeAnalysisResponse analysisResponse;
+            try
+            {
+                logger.LogInformation("Claude analysis started. SignalId={SignalId}", tradingSignal.Id);
+                analysisResponse = await claudeAnalysisService.AnalyzeAsync(
+                    payload,
+                    marketContext,
+                    marketStatus,
+                    filterContext,
+                    workToken);
+                logger.LogInformation(
+                    "Claude analysis completed. SignalId={SignalId}, IsFallback={IsFallback}",
+                    tradingSignal.Id,
+                    analysisResponse.IsFallback);
+            }
+            catch (Exception exception) when (exception is OperationCanceledException or TaskCanceledException)
+            {
+                logger.LogWarning(exception, "Claude analysis canceled or timed out. SignalId={SignalId}", tradingSignal.Id);
+                return await FinalizeAiFailureAsync(
+                    webhookLog,
+                    tradingSignal,
+                    source,
+                    isTest,
+                    "Claude analysis timeout/failure");
+            }
+            catch (Exception exception)
+            {
+                logger.LogError(exception, "Claude analysis failed unexpectedly. SignalId={SignalId}", tradingSignal.Id);
+                return await FinalizeAiFailureAsync(
+                    webhookLog,
+                    tradingSignal,
+                    source,
+                    isTest,
+                    "Claude analysis timeout/failure");
+            }
 
-            var duplicateBuyBlocked = await TryBlockDuplicateBuyAsync(tradingSignal, analysisResponse, cancellationToken);
+            if (analysisResponse.IsFallback)
+            {
+                return await FinalizeAiFailureAsync(
+                    webhookLog,
+                    tradingSignal,
+                    source,
+                    isTest,
+                    analysisResponse.Error ?? "Claude analysis timeout/failure",
+                    analysisResponse.RawResponse);
+            }
+
+            if (analysisResponse.Analysis is not null)
+            {
+                SignalFilterService.ApplyPostClaudeAdjustments(
+                    analysisResponse.Analysis,
+                    filterContext,
+                    marketStatus,
+                    settings,
+                    duplicateBuyBlocked: false);
+            }
+
+            ApplyClaudeAnalysis(tradingSignal, analysisResponse);
+            await SaveChangesAsync();
+
+            var duplicateBuyBlocked = await TryBlockDuplicateBuyAsync(tradingSignal, analysisResponse);
+            if (duplicateBuyBlocked && analysisResponse.Analysis is not null)
+            {
+                SignalFilterService.ApplyPostClaudeAdjustments(
+                    analysisResponse.Analysis,
+                    filterContext,
+                    marketStatus,
+                    settings,
+                    duplicateBuyBlocked: true);
+                ApplyClaudeAnalysis(tradingSignal, analysisResponse);
+                await SaveChangesAsync();
+            }
 
             var sendTelegram = !duplicateBuyBlocked && !isTest && NotificationFilter.ShouldSendTelegram(settings, analysisResponse, marketStatus);
             var sendTestTelegram = !duplicateBuyBlocked && isTest && settings.SendTestTelegram;
 
-            if (sendTelegram)
-            {
-                await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, isTest: false, marketStatus, cancellationToken);
-                tradingSignal.Notified = true;
-            }
-            else if (sendTestTelegram)
-            {
-                await telegramNotificationService.SendSignalAsync(tradingSignal, analysisResponse.IsFallback, isTest: true, marketStatus, cancellationToken);
-                tradingSignal.Notified = true;
-            }
-            else if (duplicateBuyBlocked && settings.SendDuplicateBuyNotifications && !isTest)
-            {
-                await telegramNotificationService.SendDuplicateBuyAsync(tradingSignal, marketStatus, cancellationToken);
-                tradingSignal.Notified = true;
-            }
-            else
-            {
-                tradingSignal.Notified = false;
-            }
+            await TrySendTelegramAsync(
+                tradingSignal,
+                analysisResponse,
+                marketStatus,
+                isTest,
+                sendTelegram,
+                sendTestTelegram,
+                duplicateBuyBlocked,
+                workToken);
 
-            await dbContext.SaveChangesAsync(cancellationToken);
+            await SaveChangesAsync();
 
             var allowPositions = !isTest || settings.AllowTestTrades;
-            PositionActionResult? positionResult = null;
-
             if (allowPositions)
             {
-                positionResult = await positionManagerService.ProcessWebhookSignalAsync(
+                await TryProcessPositionsAsync(
                     tradingSignal,
                     marketContext,
                     analysisResponse,
                     sendTelegram || sendTestTelegram,
-                    cancellationToken);
-
-                if (!string.IsNullOrWhiteSpace(positionResult.SkippedReason))
-                {
-                    tradingSignal.Notes = string.IsNullOrWhiteSpace(tradingSignal.Notes)
-                        ? positionResult.SkippedReason
-                        : $"{tradingSignal.Notes} | {positionResult.SkippedReason}";
-                    await dbContext.SaveChangesAsync(cancellationToken);
-                }
-
-                if (positionResult.OpenedPosition is not null && !isTest)
-                {
-                    await telegramNotificationService.SendPositionOpenedAsync(positionResult.OpenedPosition, cancellationToken);
-                }
-
-                if (positionResult.ClosedPosition is not null && !isTest)
-                {
-                    await telegramNotificationService.SendPositionClosedAsync(positionResult.ClosedPosition, cancellationToken);
-                }
+                    isTest,
+                    workToken);
             }
             else if (isTest)
             {
@@ -250,32 +288,247 @@ public sealed class WebhookProcessorService(
                     tradingSignal.Id);
             }
 
-            webhookLog.ResultStatus = "SUCCESS";
-            webhookLog.ErrorMessage = null;
-            await dbContext.SaveChangesAsync(cancellationToken);
-
-            return new WebhookProcessResponse
-            {
-                Success = true,
-                WebhookLogId = webhookLog.Id,
-                SignalId = tradingSignal.Id,
-                Source = source,
-                IsTest = isTest,
-                ResultStatus = webhookLog.ResultStatus,
-                Signal = tradingSignal
-            };
+            return await FinalizeSuccessAsync(webhookLog, tradingSignal, source, isTest);
         }
         catch (Exception exception)
         {
             logger.LogError(exception, "Webhook processing failed for log {WebhookLogId}.", webhookLog.Id);
-            return await FailAsync(webhookLog, "ERROR", "Webhook processing failed unexpectedly.", cancellationToken);
+            return await FailAsync(webhookLog, WebhookResultStatuses.Error, "Webhook processing failed unexpectedly.");
         }
+    }
+
+    private async Task<WebhookProcessResponse> FinalizePreClaudeAsync(
+        WebhookRequestLog webhookLog,
+        TradingSignal tradingSignal,
+        PreClaudeFilterResult preClaudeResult,
+        string source,
+        bool isTest)
+    {
+        tradingSignal.ClaudeAction = preClaudeResult.Decision;
+        tradingSignal.ShortReason = preClaudeResult.Reason;
+        tradingSignal.ReasonCategories = preClaudeResult.ReasonCategories;
+        tradingSignal.IgnoredReason = preClaudeResult.Reason;
+        tradingSignal.IgnoredBy = preClaudeResult.IgnoredBy;
+        tradingSignal.ShouldNotify = false;
+        tradingSignal.Notified = false;
+
+        await SaveChangesAsync();
+        await FinalizeWebhookLogAsync(webhookLog, WebhookResultStatuses.Success, null);
+
+        logger.LogInformation(
+            "Signal finalized before Claude. SignalId={SignalId}, Decision={Decision}, Categories={Categories}",
+            tradingSignal.Id,
+            preClaudeResult.Decision,
+            preClaudeResult.ReasonCategories);
+
+        return BuildResponse(success: true, webhookLog, tradingSignal, source, isTest);
+    }
+
+    private async Task<WebhookProcessResponse> FinalizeMarketIgnoredAsync(
+        WebhookRequestLog webhookLog,
+        TradingSignal tradingSignal,
+        MarketStatusDto marketStatus,
+        bool isTest,
+        string source)
+    {
+        tradingSignal.ClaudeAction = "IGNORE";
+        tradingSignal.ShortReason = "Market closed";
+        tradingSignal.ReasonCategories = SignalReasonCategories.SessionRisk;
+        tradingSignal.IgnoredReason = marketStatusService.GetIgnoredReason(marketStatus);
+        tradingSignal.IgnoredBy = SignalIgnoredBy.MarketStatus;
+        tradingSignal.ShouldNotify = false;
+        tradingSignal.Notified = false;
+
+        await SaveChangesAsync();
+
+        if (settings.SendMarketClosedNotifications && !isTest)
+        {
+            try
+            {
+                await telegramNotificationService.SendMarketClosedAsync(tradingSignal, marketStatus, DbCancellation);
+                tradingSignal.Notified = true;
+                await SaveChangesAsync();
+                logger.LogInformation("Market-closed Telegram sent. SignalId={SignalId}", tradingSignal.Id);
+            }
+            catch (Exception exception)
+            {
+                logger.LogWarning(exception, "Market-closed Telegram failed. SignalId={SignalId}", tradingSignal.Id);
+            }
+        }
+
+        logger.LogInformation(
+            "Signal ignored due to market status. SignalId={SignalId}, Market={Market}, Status={Status}",
+            tradingSignal.Id,
+            marketStatus.MarketName,
+            marketStatus.Status);
+
+        await FinalizeWebhookLogAsync(webhookLog, WebhookResultStatuses.Ignored, null);
+
+        return BuildResponse(
+            success: true,
+            webhookLog,
+            tradingSignal,
+            source,
+            isTest,
+            marketIgnored: true,
+            marketStatus);
+    }
+
+    private async Task<WebhookProcessResponse> FinalizeAiFailureAsync(
+        WebhookRequestLog webhookLog,
+        TradingSignal tradingSignal,
+        string source,
+        bool isTest,
+        string reason,
+        string? claudeRawResponse = null)
+    {
+        tradingSignal.ClaudeAction = "IGNORE";
+        tradingSignal.ShortReason = reason;
+        tradingSignal.ClaudeRawResponse = claudeRawResponse;
+        tradingSignal.ShouldNotify = false;
+        tradingSignal.Notified = false;
+
+        await SaveChangesAsync();
+        await FinalizeWebhookLogAsync(webhookLog, WebhookResultStatuses.AiFailed, reason);
+
+        logger.LogInformation(
+            "Webhook finalized with AI failure. WebhookLogId={WebhookLogId}, SignalId={SignalId}, Reason={Reason}",
+            webhookLog.Id,
+            tradingSignal.Id,
+            reason);
+
+        return BuildResponse(success: true, webhookLog, tradingSignal, source, isTest);
+    }
+
+    private async Task<WebhookProcessResponse> FinalizeSuccessAsync(
+        WebhookRequestLog webhookLog,
+        TradingSignal tradingSignal,
+        string source,
+        bool isTest)
+    {
+        await FinalizeWebhookLogAsync(webhookLog, WebhookResultStatuses.Success, null);
+
+        logger.LogInformation(
+            "Webhook log finalized. WebhookLogId={WebhookLogId}, SignalId={SignalId}, Status={Status}",
+            webhookLog.Id,
+            tradingSignal.Id,
+            WebhookResultStatuses.Success);
+
+        return BuildResponse(success: true, webhookLog, tradingSignal, source, isTest);
+    }
+
+    private async Task TrySendTelegramAsync(
+        TradingSignal tradingSignal,
+        ClaudeAnalysisResponse analysisResponse,
+        MarketStatusDto marketStatus,
+        bool isTest,
+        bool sendTelegram,
+        bool sendTestTelegram,
+        bool duplicateBuyBlocked,
+        CancellationToken workToken)
+    {
+        try
+        {
+            if (sendTelegram)
+            {
+                await telegramNotificationService.SendSignalAsync(
+                    tradingSignal,
+                    analysisResponse.IsFallback,
+                    isTest: false,
+                    marketStatus,
+                    workToken);
+                tradingSignal.Notified = true;
+                logger.LogInformation("Telegram sent. SignalId={SignalId}", tradingSignal.Id);
+            }
+            else if (sendTestTelegram)
+            {
+                await telegramNotificationService.SendSignalAsync(
+                    tradingSignal,
+                    analysisResponse.IsFallback,
+                    isTest: true,
+                    marketStatus,
+                    workToken);
+                tradingSignal.Notified = true;
+                logger.LogInformation("Test Telegram sent. SignalId={SignalId}", tradingSignal.Id);
+            }
+            else if (duplicateBuyBlocked && settings.SendDuplicateBuyNotifications && !isTest)
+            {
+                await telegramNotificationService.SendDuplicateBuyAsync(tradingSignal, marketStatus, workToken);
+                tradingSignal.Notified = true;
+                logger.LogInformation("Duplicate-buy Telegram sent. SignalId={SignalId}", tradingSignal.Id);
+            }
+            else
+            {
+                tradingSignal.Notified = false;
+                logger.LogInformation("Telegram skipped. SignalId={SignalId}", tradingSignal.Id);
+            }
+        }
+        catch (Exception exception)
+        {
+            tradingSignal.Notified = false;
+            logger.LogWarning(exception, "Telegram failed but webhook processing continues. SignalId={SignalId}", tradingSignal.Id);
+        }
+    }
+
+    private async Task TryProcessPositionsAsync(
+        TradingSignal tradingSignal,
+        MarketContext marketContext,
+        ClaudeAnalysisResponse analysisResponse,
+        bool notificationPassed,
+        bool isTest,
+        CancellationToken workToken)
+    {
+        try
+        {
+            var positionResult = await positionManagerService.ProcessWebhookSignalAsync(
+                tradingSignal,
+                marketContext,
+                analysisResponse,
+                notificationPassed,
+                workToken);
+
+            if (!string.IsNullOrWhiteSpace(positionResult.SkippedReason))
+            {
+                tradingSignal.Notes = string.IsNullOrWhiteSpace(tradingSignal.Notes)
+                    ? positionResult.SkippedReason
+                    : $"{tradingSignal.Notes} | {positionResult.SkippedReason}";
+                await SaveChangesAsync();
+            }
+
+            if (positionResult.OpenedPosition is not null && !isTest)
+            {
+                await telegramNotificationService.SendPositionOpenedAsync(positionResult.OpenedPosition, DbCancellation);
+            }
+
+            if (positionResult.ClosedPosition is not null && !isTest)
+            {
+                await telegramNotificationService.SendPositionClosedAsync(positionResult.ClosedPosition, DbCancellation);
+            }
+        }
+        catch (Exception exception)
+        {
+            logger.LogWarning(exception, "Position processing failed but webhook processing continues. SignalId={SignalId}", tradingSignal.Id);
+        }
+    }
+
+    private static void ApplyClaudeAnalysis(TradingSignal tradingSignal, ClaudeAnalysisResponse analysisResponse)
+    {
+        tradingSignal.ClaudeAction = analysisResponse.Analysis?.Action;
+        tradingSignal.Confidence = analysisResponse.Analysis?.Confidence;
+        tradingSignal.RiskLevel = analysisResponse.Analysis?.RiskLevel;
+        tradingSignal.ClaudeRawResponse = analysisResponse.RawResponse;
+        tradingSignal.ShortReason = analysisResponse.Analysis?.ShortReason;
+        tradingSignal.SuggestedStopLoss = analysisResponse.Analysis?.SuggestedStopLoss;
+        tradingSignal.SuggestedTakeProfit = analysisResponse.Analysis?.SuggestedTakeProfit;
+        tradingSignal.RiskRewardRatio = analysisResponse.Analysis?.RiskRewardRatio;
+        tradingSignal.PositionSizePercent = analysisResponse.Analysis?.PositionSizePercent;
+        tradingSignal.ShouldNotify = analysisResponse.Analysis?.ShouldNotify;
+        tradingSignal.ReasonCategories = analysisResponse.Analysis?.ReasonCategories;
     }
 
     private async Task<bool> TryBlockDuplicateBuyAsync(
         TradingSignal tradingSignal,
-        ClaudeAnalysisResponse analysisResponse,
-        CancellationToken cancellationToken)
+        ClaudeAnalysisResponse analysisResponse)
     {
         if (settings.AllowScaleIn)
         {
@@ -289,7 +542,7 @@ public sealed class WebhookProcessorService(
 
         var openPositionCount = await dbContext.Positions.CountAsync(
             position => position.Symbol == tradingSignal.Symbol && position.Status == PositionStatus.Open,
-            cancellationToken);
+            DbCancellation);
 
         if (openPositionCount < settings.MaxPositionsPerSymbol)
         {
@@ -299,13 +552,15 @@ public sealed class WebhookProcessorService(
         tradingSignal.IgnoredReason = "Position already open";
         tradingSignal.IgnoredBy = SignalIgnoredBy.PositionRules;
         tradingSignal.ShouldNotify = false;
+        tradingSignal.ClaudeAction = "IGNORE";
+        tradingSignal.ReasonCategories = SignalReasonCategories.DuplicateBuy;
 
         if (string.IsNullOrWhiteSpace(tradingSignal.ShortReason))
         {
             tradingSignal.ShortReason = "Position already open";
         }
 
-        await dbContext.SaveChangesAsync(cancellationToken);
+        await SaveChangesAsync();
 
         logger.LogInformation(
             "Signal {SignalId} blocked by position rules. Symbol={Symbol}, OpenPositions={Count}",
@@ -316,15 +571,19 @@ public sealed class WebhookProcessorService(
         return true;
     }
 
+    private async Task FinalizeWebhookLogAsync(WebhookRequestLog webhookLog, string status, string? errorMessage)
+    {
+        webhookLog.ResultStatus = status;
+        webhookLog.ErrorMessage = errorMessage;
+        await SaveChangesAsync();
+    }
+
     private async Task<WebhookProcessResponse> FailAsync(
         WebhookRequestLog webhookLog,
         string status,
-        string error,
-        CancellationToken cancellationToken)
+        string error)
     {
-        webhookLog.ResultStatus = status;
-        webhookLog.ErrorMessage = error;
-        await dbContext.SaveChangesAsync(cancellationToken);
+        await FinalizeWebhookLogAsync(webhookLog, status, error);
 
         return new WebhookProcessResponse
         {
@@ -336,6 +595,30 @@ public sealed class WebhookProcessorService(
             Error = error
         };
     }
+
+    private static WebhookProcessResponse BuildResponse(
+        bool success,
+        WebhookRequestLog webhookLog,
+        TradingSignal tradingSignal,
+        string source,
+        bool isTest,
+        bool marketIgnored = false,
+        MarketStatusDto? marketStatus = null)
+        => new()
+        {
+            Success = success,
+            WebhookLogId = webhookLog.Id,
+            SignalId = tradingSignal.Id,
+            Source = source,
+            IsTest = isTest,
+            ResultStatus = webhookLog.ResultStatus,
+            Signal = tradingSignal,
+            MarketIgnored = marketIgnored,
+            MarketStatus = marketStatus
+        };
+
+    private Task SaveChangesAsync()
+        => dbContext.SaveChangesAsync(DbCancellation);
 
     private static string SerializeHeaders(IHeaderDictionary headers)
     {

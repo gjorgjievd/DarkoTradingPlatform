@@ -29,6 +29,21 @@ public sealed class TradingViewWebhookRequest
     [JsonPropertyName("volume")]
     public string? Volume { get; init; }
 
+    [JsonPropertyName("ema9")]
+    public string? Ema9 { get; init; }
+
+    [JsonPropertyName("ema20")]
+    public string? Ema20 { get; init; }
+
+    [JsonPropertyName("ema50")]
+    public string? Ema50 { get; init; }
+
+    [JsonPropertyName("avgVolume")]
+    public string? AvgVolume { get; init; }
+
+    [JsonPropertyName("volumeSpike")]
+    public string? VolumeSpike { get; init; }
+
     [JsonPropertyName("timestamp")]
     public string? Timestamp { get; init; }
 
