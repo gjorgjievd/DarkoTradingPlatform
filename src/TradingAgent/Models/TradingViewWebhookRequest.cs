@@ -44,6 +44,9 @@ public sealed class TradingViewWebhookRequest
     [JsonPropertyName("volumeSpike")]
     public string? VolumeSpike { get; init; }
 
+    [JsonPropertyName("macd")]
+    public string? Macd { get; init; }
+
     [JsonPropertyName("timestamp")]
     public string? Timestamp { get; init; }
 

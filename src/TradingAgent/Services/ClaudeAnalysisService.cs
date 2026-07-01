@@ -19,13 +19,11 @@ public sealed class ClaudeAnalysisService(
     private const int MaxLoggedResponseLength = 2000;
 
     private const string FilterSystemPrompt =
-        "You are a professional trading signal filter. TradingView webhook indicators are the PRIMARY source of truth for strategy signals (EMA9, EMA20, EMA50, RSI, volume, volumeSpike). " +
-        "Yahoo Finance data is SECONDARY validation/context only: current price sanity, large price drift, market session, 52-week range, ATR/volatility, and liquidity. " +
-        "NEVER reject a signal solely because Yahoo EMA/RSI differs from TradingView EMA/RSI. Mention indicator mismatches only as warnings and modest confidence reductions. " +
-        "For BUY alerts, return decision BUY, WAIT, or IGNORE. Prefer WAIT over IGNORE when the setup is not clearly bad. " +
-        "BUY when TradingView EMA9 > EMA20, RSI >= 50, volumeSpike >= 70, price is close to Yahoo current price, and conviction meets the session threshold. " +
-        "WAIT when confirmation is weak but not clearly invalid (confidence 40-64). " +
-        "IGNORE only for clear contradictions, extreme price drift, very weak BUY inputs (RSI < 45 or volumeSpike < 50), or obvious high-risk conditions. " +
+        "You are a trading risk manager and market context analyst. TradingView already generated the technical signal. " +
+        "Do NOT validate, recalculate, or reject signals because Yahoo EMA, RSI, or MACD differ from TradingView. " +
+        "TradingView is the single source of truth for EMA9, EMA20, EMA50, RSI, MACD, volume, volumeSpike, signal direction, and timeframe. " +
+        "Your job is to assess external risks only: breaking news, earnings today, high volatility, trading halts, dangerous gaps, low liquidity, and extreme price drift context. " +
+        "Answer whether there are material non-technical risks. Prefer WAIT over IGNORE when risks are uncertain. " +
         "Respond ONLY with valid JSON matching the required schema.";
 
     private const string FilterJsonSchema =
@@ -35,6 +33,14 @@ public sealed class ClaudeAnalysisService(
           "confidence": 0-100,
           "risk": "LOW | MEDIUM | HIGH",
           "reason": "...",
+          "breakingNegativeNews": true | false,
+          "earningsToday": true | false,
+          "highVolatility": true | false,
+          "tradingHalted": true | false,
+          "dangerousGap": true | false,
+          "gapPercent": number | null,
+          "lowLiquidity": true | false,
+          "newsSummary": "...",
           "stopLoss": number | null,
           "takeProfit": number | null,
           "riskRewardRatio": number | null,
@@ -68,28 +74,30 @@ public sealed class ClaudeAnalysisService(
         }
 
         var session = marketStatus.MarketSession;
-        var threshold = marketStatus.SessionConfidenceThreshold;
+        var bands = ConfidenceDecisionBands.Get(session);
         var yahooValidation = new
         {
             currentPrice = marketContext?.CurrentPrice,
+            currentVolume = marketContext?.CurrentVolume,
+            averageVolume20 = marketContext?.AverageVolume20,
             atr = marketContext?.Atr,
             week52High = marketContext?.Week52High,
             week52Low = marketContext?.Week52Low,
-            currentVolume = marketContext?.CurrentVolume,
-            averageVolume20 = marketContext?.AverageVolume20,
             priceDriftPercent = filterContext.PriceDriftPercent,
-            maxAllowedDriftPercent = filterContext.MaxAllowedDriftPercent,
-            indicatorWarnings = filterContext.IndicatorWarnings
+            marketSession = session,
+            isOpen = marketStatus.IsOpen,
+            isWeekend = marketStatus.IsWeekend,
+            isHoliday = marketStatus.IsHoliday
         };
 
         var prompt =
-            $"You are filtering a TradingView alert. Return ONLY valid JSON with this schema:\n{FilterJsonSchema}\n" +
+            $"Assess external market risk for a TradingView alert. Return ONLY valid JSON with this schema:\n{FilterJsonSchema}\n" +
             $"Market session: {session}\n" +
-            $"Session confidence threshold: {threshold}\n" +
-            $"TradingView indicators (PRIMARY): {JsonSerializer.Serialize(filterContext.TradingView, SerializerOptions)}\n" +
-            $"Yahoo validation/context (SECONDARY): {JsonSerializer.Serialize(yahooValidation, SerializerOptions)}\n" +
+            $"Decision bands for BUY signals: BUY >= {bands.BuyThreshold}, WAIT {bands.WaitMinimum}-{bands.BuyThreshold - 1}, IGNORE < {bands.WaitMinimum}\n" +
+            $"TradingView technical signal (AUTHORITATIVE - do not re-validate indicators): {JsonSerializer.Serialize(filterContext.TradingView, SerializerOptions)}\n" +
+            $"Yahoo market validation/context ONLY (price, volume, session, volatility): {JsonSerializer.Serialize(yahooValidation, SerializerOptions)}\n" +
             $"Raw TradingView payload: {JsonSerializer.Serialize(signal, SerializerOptions)}\n" +
-            GetSessionGuidance(session, threshold);
+            GetSessionGuidance(session, bands.BuyThreshold);
         var result = await SendRequestAsync(prompt, cancellationToken, FilterSystemPrompt);
 
         if (!result.IsSuccess)
@@ -282,16 +290,16 @@ public sealed class ClaudeAnalysisService(
         }
     }
 
-    private static string GetSessionGuidance(string marketSession, int threshold)
+    private static string GetSessionGuidance(string marketSession, int buyThreshold)
     {
         if (marketSession == MarketSessionValues.Regular)
         {
-            return $"Regular session: use TradingView indicators as primary. Threshold for BUY notify is {threshold}.";
+            return $"Regular session. Focus on news, earnings, gaps, halts, and liquidity. BUY threshold is {buyThreshold}.";
         }
 
         return
-            $"Extended-hours session ({marketSession}): Yahoo is context only. Threshold for BUY notify is {threshold}. " +
-            "Be mindful of liquidity/session risk, but do not auto-reject because Yahoo EMA/RSI differs from TradingView.";
+            $"Extended-hours session ({marketSession}). Assess liquidity and session risk. " +
+            $"Do not compare Yahoo indicators to TradingView. BUY threshold is {buyThreshold}.";
     }
 
     private static ClaudeAnalysisResponse Fallback(string error)
@@ -357,7 +365,15 @@ public sealed class ClaudeAnalysisService(
                 SuggestedTakeProfit = GetDecimal(root, "takeProfit") ?? GetDecimal(root, "suggestedTakeProfit"),
                 RiskRewardRatio = GetDecimal(root, "riskRewardRatio"),
                 PositionSizePercent = GetDecimal(root, "positionSizePercent"),
-                ShouldNotify = GetBool(root, "shouldNotify")
+                ShouldNotify = GetBool(root, "shouldNotify"),
+                BreakingNegativeNews = GetBool(root, "breakingNegativeNews"),
+                EarningsToday = GetBool(root, "earningsToday"),
+                HighVolatility = GetBool(root, "highVolatility"),
+                TradingHalted = GetBool(root, "tradingHalted"),
+                DangerousGap = GetBool(root, "dangerousGap"),
+                GapPercent = GetDecimal(root, "gapPercent"),
+                LowLiquidity = GetBool(root, "lowLiquidity"),
+                NewsSummary = GetString(root, "newsSummary")
             };
         }
         catch (JsonException)

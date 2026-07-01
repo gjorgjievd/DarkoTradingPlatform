@@ -12,6 +12,8 @@ public sealed class TradingViewIndicators
     public decimal? Volume { get; init; }
     public decimal? AvgVolume { get; init; }
     public decimal? VolumeSpike { get; init; }
+    public decimal? Macd { get; init; }
+    public string? Timeframe { get; init; }
 }
 
 public sealed class SignalFilterContext
@@ -21,11 +23,7 @@ public sealed class SignalFilterContext
     public decimal MaxAllowedDriftPercent { get; init; }
     public bool HasPriceDriftWarning { get; init; }
     public bool HasExtremePriceDrift { get; init; }
-    public int PriceDriftConfidencePenalty { get; init; }
-    public int IndicatorMismatchPenalty { get; init; }
     public IReadOnlyList<string> IndicatorWarnings { get; init; } = [];
-    public bool IsLooseStrategy { get; init; }
-    public int LooseStrategyPenalty { get; init; }
     public bool IsExtendedSession { get; init; }
 }
 

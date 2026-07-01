@@ -234,9 +234,11 @@ public sealed class WebhookProcessorService(
                 SignalFilterService.ApplyPostClaudeAdjustments(
                     analysisResponse.Analysis,
                     filterContext,
+                    marketContext,
                     marketStatus,
                     settings,
-                    duplicateBuyBlocked: false);
+                    duplicateBuyBlocked: false,
+                    logger);
             }
 
             ApplyClaudeAnalysis(tradingSignal, analysisResponse);
@@ -248,9 +250,11 @@ public sealed class WebhookProcessorService(
                 SignalFilterService.ApplyPostClaudeAdjustments(
                     analysisResponse.Analysis,
                     filterContext,
+                    marketContext,
                     marketStatus,
                     settings,
-                    duplicateBuyBlocked: true);
+                    duplicateBuyBlocked: true,
+                    logger);
                 ApplyClaudeAnalysis(tradingSignal, analysisResponse);
                 await SaveChangesAsync();
             }

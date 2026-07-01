@@ -20,6 +20,14 @@ public sealed class ClaudeAnalysisResult
     public decimal? PositionSizePercent { get; set; }
     public bool? ShouldNotify { get; set; }
     public string? ReasonCategories { get; set; }
+    public bool? BreakingNegativeNews { get; set; }
+    public bool? EarningsToday { get; set; }
+    public bool? HighVolatility { get; set; }
+    public bool? TradingHalted { get; set; }
+    public bool? DangerousGap { get; set; }
+    public decimal? GapPercent { get; set; }
+    public bool? LowLiquidity { get; set; }
+    public string? NewsSummary { get; set; }
 }
 
 public sealed class ClaudeTestResult

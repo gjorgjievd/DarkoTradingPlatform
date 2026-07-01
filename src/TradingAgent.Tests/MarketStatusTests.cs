@@ -177,8 +177,8 @@ public class MarketStatusServiceTests
 
         Assert.False(service.ShouldIgnoreSignal(preMarket));
         Assert.False(service.ShouldIgnoreSignal(overnight));
-        Assert.Equal(75, preMarket.SessionConfidenceThreshold);
-        Assert.Equal(85, overnight.SessionConfidenceThreshold);
+        Assert.Equal(70, preMarket.SessionConfidenceThreshold);
+        Assert.Equal(75, overnight.SessionConfidenceThreshold);
     }
 
     [Fact]

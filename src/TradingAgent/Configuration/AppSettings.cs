@@ -29,10 +29,10 @@ public sealed class AppSettings
     public bool IgnoreSignalsWhenMarketClosed { get; set; } = true;
     public bool SendMarketClosedNotifications { get; set; }
     public bool Enable24_5Trading { get; set; } = true;
-    public int MinConfidenceRegular { get; set; } = 65;
-    public int MinConfidencePremarket { get; set; } = 75;
-    public int MinConfidenceAfterHours { get; set; } = 75;
-    public int MinConfidenceOvernight { get; set; } = 85;
+    public int MinConfidenceRegular { get; set; } = 60;
+    public int MinConfidencePremarket { get; set; } = 70;
+    public int MinConfidenceAfterHours { get; set; } = 70;
+    public int MinConfidenceOvernight { get; set; } = 75;
     public bool AllowScaleIn { get; set; }
     public int MaxPositionsPerSymbol { get; set; } = 1;
     public bool SendDuplicateBuyNotifications { get; set; }

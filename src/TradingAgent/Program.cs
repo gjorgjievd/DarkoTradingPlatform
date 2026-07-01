@@ -63,16 +63,16 @@ builder.Services.AddSingleton(sp =>
         Enable24_5Trading = !bool.TryParse(configuration["ENABLE_24_5_TRADING"], out var enable24_5) || enable24_5,
         MinConfidenceRegular = int.TryParse(configuration["MIN_CONFIDENCE_REGULAR"], out var minConfRegular)
             ? Math.Clamp(minConfRegular, 0, 100)
-            : 65,
+            : 60,
         MinConfidencePremarket = int.TryParse(configuration["MIN_CONFIDENCE_PREMARKET"], out var minConfPremarket)
             ? Math.Clamp(minConfPremarket, 0, 100)
-            : 75,
+            : 70,
         MinConfidenceAfterHours = int.TryParse(configuration["MIN_CONFIDENCE_AFTER_HOURS"], out var minConfAfterHours)
             ? Math.Clamp(minConfAfterHours, 0, 100)
-            : 75,
+            : 70,
         MinConfidenceOvernight = int.TryParse(configuration["MIN_CONFIDENCE_OVERNIGHT"], out var minConfOvernight)
             ? Math.Clamp(minConfOvernight, 0, 100)
-            : 85,
+            : 75,
         MaxPriceDriftPercentRegular = decimal.TryParse(configuration["MAX_PRICE_DRIFT_PERCENT_REGULAR"], out var driftRegular)
             ? Math.Clamp(driftRegular, 0.1m, 10m)
             : 1.0m,

@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging;
 using System.Globalization;
 using System.Text.Json;
 using TradingAgent.Configuration;
@@ -16,11 +17,13 @@ public static class SignalFilterService
         {
             Signal = payload.Signal?.Trim().ToUpperInvariant() ?? string.Empty,
             Strategy = payload.Strategy?.Trim(),
+            Timeframe = payload.Timeframe?.Trim(),
             Price = ParseDecimal(payload.Price),
             Ema9 = ParseDecimal(payload.Ema9) ?? ParseFromAdditional(payload, "ema9"),
             Ema20 = ParseDecimal(payload.Ema20) ?? ParseFromAdditional(payload, "ema20"),
             Ema50 = ParseDecimal(payload.Ema50) ?? ParseFromAdditional(payload, "ema50"),
             Rsi = ParseDecimal(payload.Rsi) ?? ParseFromAdditional(payload, "rsi"),
+            Macd = ParseDecimal(payload.Macd) ?? ParseFromAdditional(payload, "macd"),
             Volume = ParseDecimal(payload.Volume) ?? ParseFromAdditional(payload, "volume"),
             AvgVolume = ParseDecimal(payload.AvgVolume) ?? ParseFromAdditional(payload, "avgVolume", "avg_volume"),
             VolumeSpike = ParseDecimal(payload.VolumeSpike) ?? ParseFromAdditional(payload, "volumeSpike", "volume_spike")
@@ -45,12 +48,7 @@ public static class SignalFilterService
         var priceDriftPercent = CalculatePriceDriftPercent(tradingView.Price, marketContext.CurrentPrice);
         var hasExtremePriceDrift = priceDriftPercent.HasValue && priceDriftPercent.Value > ExtremePriceDriftPercent;
         var hasPriceDriftWarning = priceDriftPercent.HasValue && priceDriftPercent.Value > maxAllowedDrift;
-        var priceDriftPenalty = CalculatePriceDriftPenalty(priceDriftPercent, maxAllowedDrift, hasExtremePriceDrift);
-
         var indicatorWarnings = BuildIndicatorWarnings(tradingView, marketContext);
-        var indicatorPenalty = Math.Clamp(indicatorWarnings.Count * 5, 0, 15);
-
-        var isLooseStrategy = tradingView.Strategy?.Contains("LOOSE", StringComparison.OrdinalIgnoreCase) == true;
 
         return new SignalFilterContext
         {
@@ -59,11 +57,7 @@ public static class SignalFilterService
             MaxAllowedDriftPercent = maxAllowedDrift,
             HasPriceDriftWarning = hasPriceDriftWarning,
             HasExtremePriceDrift = hasExtremePriceDrift,
-            PriceDriftConfidencePenalty = priceDriftPenalty,
-            IndicatorMismatchPenalty = indicatorPenalty,
             IndicatorWarnings = indicatorWarnings,
-            IsLooseStrategy = isLooseStrategy,
-            LooseStrategyPenalty = isLooseStrategy ? 10 : 0,
             IsExtendedSession = isExtendedSession
         };
     }
@@ -104,105 +98,19 @@ public static class SignalFilterService
     public static ClaudeAnalysisResult ApplyPostClaudeAdjustments(
         ClaudeAnalysisResult result,
         SignalFilterContext context,
+        MarketContext marketContext,
         MarketStatusDto marketStatus,
         AppSettings settings,
-        bool duplicateBuyBlocked)
-    {
-        var categories = new List<string>();
-        var tradingView = context.TradingView;
-        var threshold = marketStatus.SessionConfidenceThreshold;
-        var confidence = result.Confidence ?? 0;
-        var reasonParts = new List<string>();
-
-        if (!string.IsNullOrWhiteSpace(result.ShortReason))
-        {
-            reasonParts.Add(result.ShortReason);
-        }
-
-        if (duplicateBuyBlocked)
-        {
-            result.Action = "IGNORE";
-            result.ShouldNotify = false;
-            categories.Add(SignalReasonCategories.DuplicateBuy);
-            reasonParts.Add("Duplicate BUY blocked because an open position already exists.");
-            result.ShortReason = string.Join(" ", reasonParts);
-            result.ReasonCategories = SignalReasonCategories.Join(categories);
-            return result;
-        }
-
-        if (context.HasPriceDriftWarning)
-        {
-            categories.Add(SignalReasonCategories.PriceDriftWarning);
-            reasonParts.Add(
-                $"Price drift warning: TradingView/Yahoo differ by {context.PriceDriftPercent:0.##}% (allowed {context.MaxAllowedDriftPercent:0.##}%).");
-        }
-
-        if (context.IndicatorWarnings.Count > 0)
-        {
-            categories.Add(SignalReasonCategories.WeakConfirmation);
-            reasonParts.Add($"Indicator mismatch warning (TradingView is primary): {string.Join("; ", context.IndicatorWarnings)}.");
-        }
-
-        if (context.IsLooseStrategy)
-        {
-            categories.Add(SignalReasonCategories.WeakConfirmation);
-            reasonParts.Add("LOOSE strategy reduces confidence.");
-        }
-
-        confidence -= context.PriceDriftConfidencePenalty
-            + context.IndicatorMismatchPenalty
-            + context.LooseStrategyPenalty;
-        confidence = Math.Clamp(confidence, 0, 100);
-        result.Confidence = confidence;
-
-        if (string.Equals(tradingView.Signal, "BUY", StringComparison.OrdinalIgnoreCase))
-        {
-            if (tradingView.Rsi is < 45)
-            {
-                result.Action = "IGNORE";
-                categories.Add(SignalReasonCategories.WeakConfirmation);
-                reasonParts.Add("TradingView RSI is below 45 for a BUY signal.");
-            }
-            else if (tradingView.VolumeSpike is < 50)
-            {
-                result.Action = "IGNORE";
-                categories.Add(SignalReasonCategories.WeakConfirmation);
-                reasonParts.Add("TradingView volumeSpike is below 50 for a BUY signal.");
-            }
-            else if (confidence < threshold)
-            {
-                if (confidence >= 40)
-                {
-                    if (!string.Equals(result.Action, "IGNORE", StringComparison.OrdinalIgnoreCase))
-                    {
-                        result.Action = "WAIT";
-                    }
-
-                    categories.Add(context.IsExtendedSession
-                        ? SignalReasonCategories.SessionRisk
-                        : SignalReasonCategories.WeakConfirmation);
-                    reasonParts.Add($"Confidence {confidence} is below session threshold {threshold}.");
-                }
-                else
-                {
-                    result.Action = "IGNORE";
-                    categories.Add(SignalReasonCategories.LowConfidence);
-                    reasonParts.Add($"Confidence {confidence} is too low for this session.");
-                }
-            }
-        }
-
-        result.ShortReason = string.Join(" ", reasonParts.Distinct());
-        result.ShouldNotify = NotificationFilter.ShouldSendTelegramForDecision(
+        bool duplicateBuyBlocked,
+        ILogger? logger = null)
+        => ConfidenceEngine.Apply(
+            result,
+            context,
+            marketContext,
+            marketStatus,
             settings,
-            result.Action,
-            confidence,
-            threshold,
-            result.ShouldNotify);
-
-        result.ReasonCategories = SignalReasonCategories.Join(categories);
-        return result;
-    }
+            duplicateBuyBlocked,
+            logger);
 
     public static bool IsBuySignal(string? signal)
         => string.Equals(signal, "BUY", StringComparison.OrdinalIgnoreCase);
@@ -217,17 +125,6 @@ public static class SignalFilterService
         return Math.Abs(tradingViewPrice.Value - yahooPrice.Value) / yahooPrice.Value * 100m;
     }
 
-    private static int CalculatePriceDriftPenalty(decimal? driftPercent, decimal maxAllowedDrift, bool hasExtremePriceDrift)
-    {
-        if (!driftPercent.HasValue || hasExtremePriceDrift || driftPercent.Value <= maxAllowedDrift)
-        {
-            return 0;
-        }
-
-        var excess = driftPercent.Value - maxAllowedDrift;
-        return Math.Clamp((int)Math.Ceiling(excess * 5m), 5, 20);
-    }
-
     private static List<string> BuildIndicatorWarnings(TradingViewIndicators tradingView, MarketContext marketContext)
     {
         var warnings = new List<string>();
@@ -235,6 +132,7 @@ public static class SignalFilterService
         AddMismatchWarning(warnings, "EMA20", tradingView.Ema20, marketContext.Ema20, relativeTolerancePercent: 3m);
         AddMismatchWarning(warnings, "EMA50", tradingView.Ema50, marketContext.Ema50, relativeTolerancePercent: 3m);
         AddMismatchWarning(warnings, "RSI", tradingView.Rsi, marketContext.Rsi14, absoluteTolerance: 8m);
+        AddMismatchWarning(warnings, "MACD", tradingView.Macd, marketContext.Macd, absoluteTolerance: 1m);
         return warnings;
     }
 
